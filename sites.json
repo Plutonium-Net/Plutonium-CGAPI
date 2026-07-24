@@ -1,0 +1,16 @@
+{
+  "sites": {
+    "Crafted Cloud": {
+      "api_key": "b9c3d2c6509c74c0db54d77d9fbd31e26e9b85a86d3dfc0b6a1c5d91c8a7f4e37f2d1e6845bc9a1f0e8d4f63b72ac59f4c1de0a97b5f3d86e2c9a4f7813db6a",
+      "enabled": true,
+      "max_concurrent_sessions": 5,
+      "max_session_seconds": 1140,
+      "limits": {
+        "per_minute": 60,
+        "per_hour": 1000,
+        "per_day": 10000,
+        "per_month": 100000
+      }
+    }
+  }
+}
