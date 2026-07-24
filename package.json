@@ -1,5 +1,5 @@
 {
-  "name": "cCloud",
+  "name": "plutonium-cgapi",
   "version": "1.0.0",
   "scripts": {
     "start": "node api.js",

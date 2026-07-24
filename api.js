@@ -481,7 +481,7 @@ app.use((req, res, next) => {
 app.use(express.static(path.join(__dirname, "public")));
 
 app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
+  res.sendFile(path.join(__dirname, "public", "index.html")); // Plutonium-CGAPI status page
 });
 
 app.get("/cloud/v1/config", (req, res) => {
@@ -871,7 +871,7 @@ httpServer.listen(PORT, () => {
   const siteList = Object.entries(sites.sites);
 
   console.log("");
-  console.log(chalk.bold(" 🔌 stratus api"));
+  console.log(chalk.bold(" ⚡ Plutonium-CGAPI"));
   console.log("");
   console.log(label("port")  + "  " + chalk.white(PORT));
   console.log(label("sites") + "  " + chalk.white(siteList.length));

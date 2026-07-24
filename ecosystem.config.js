@@ -1,7 +1,7 @@
 module.exports = {
   apps: [
     {
-      name: "cCloud",
+      name: "plutonium-cgapi",
       script: "./api.js",
       instances: 1,
       exec_mode: "fork",
