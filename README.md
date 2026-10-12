@@ -60,6 +60,46 @@ pm2 save
 
 If you control a domain, you can add it as a provider and it will never be blocked. Add a `src/providers/impl/yourdomain.com.ts` using `src/providers/impl/cherrion.top.ts` as a template, set up Cloudflare Email Workers to relay inbound mail to malq's `/api/v1/inbound` endpoint, and add your domain to `src/working-providers.ts`.
 
+> **This recipe needs work first.** The pinned malq has no `/api/v1/inbound` route, no `cherrion.top.ts` template and no `src/working-providers.ts`, so the steps above do not run as written. See *receiving the code from a real mailbox* for what each half actually requires.
+
+## registration puzzles (human in the loop)
+
+RaccoonGame gates account creation behind a slide-the-piece puzzle, and the solved state is bound to the PHP session cookie *and* to the exact email + `sn` that requested it. Only the HTTP client that asked for the challenge can complete it, so the server fetches the challenge, hands the two images to a person, and relays their answer upstream:
+
+1. `POST /cloud/v1/createSession` streams NDJSON and emits `puzzle_required` carrying the challenge (`background`, `piece`, `width`, `height`, `piece_size`, `piece_y`) and a `submit_to` path.
+2. Whoever is driving the session solves it at `GET /puzzle?session=<uuid>`, which serves `api/public/puzzle.html`: drag the piece onto the gap and release.
+3. `POST /cloud/v1/puzzles/<id>` with `{ offset }` forwards the answer on that session's own cookie jar, then answers with Raccoon's verdict — `200` when accepted, `422` with Raccoon's message when not.
+4. A rejected solve raises a *fresh* challenge for the same email (up to three tries), so a mis-drag costs a retry instead of the session. Sessions also get the puzzle window added to their creation budget so a human's drag is not reaped.
+
+`GET /cloud/v1/puzzles` lists what is waiting. One solve authorises exactly one address, so puzzles are raised per account and never pooled.
+
+## receiving the code from a real mailbox
+
+Two independent filters decide whether a registration address works at all, and both fail *after* the puzzle is solved:
+
+- **Raccoon refuses disposable domains** ("Temporary email addresses are not supported"), so a blocked address throws away a human's solve. `api.js` pre-screens against the public disposable-domain blocklist (`DISPOSABLE_LIST_URL`, cached at `DISPOSABLE_LIST_FILE`).
+- **The domain has to accept mail.** Addresses must be plausible and carry an MX record; malq's pools do hand out domains with no MX at all.
+
+Even past both filters delivery stays a lottery — malq's provider pools rotate, and the same provider delivered in 15 seconds on one domain and never on the next. A domain you control removes the lottery:
+
+1. Expose malq on a public URL (Cloudflare Tunnel, or run it on your own host).
+2. Put the domain on Cloudflare, enable Email Routing, and add an Email Worker that POSTs each message to malq's inbound endpoint.
+3. Add that endpoint to malq (`POST /api/v1/inbound` — absent from the pinned version) plus a provider file for the domain that reads what it stored.
+4. Pin the provider with `MALQ_PROVIDER`.
+
+The lighter alternative needs no infrastructure: have the *user* read the code. Send the registration to an address they already hold (a Gmail alias is not disposable, so Raccoon accepts it) and relay the six digits into the session the way the puzzle offset is relayed — a `code_required` event and a `POST /cloud/v1/code` endpoint.
+
+## environment
+
+| variable | default | meaning |
+|---|---|---|
+| `PORT` | 3001 | listen port |
+| `MALQ_URL` | `http://127.0.0.1:4400` | malq base URL |
+| `MALQ_PROVIDER` | *(random)* | pin one malq provider, e.g. `lwUpdateDomain\edumailfree.com` |
+| `POOL_TARGET` | 5 | accounts to pre-create; set `0` when every account needs a human solve |
+| `DISPOSABLE_LIST_URL` | upstream blocklist | source for disposable-domain pre-screening |
+| `DISPOSABLE_LIST_FILE` | temp dir | cached copy of that list |
+
 ## integrating into your server
 
 ```js

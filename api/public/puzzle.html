@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Plutonium-CGAPI — registration puzzle</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root { --pink:#e8175d; --bg:#000; --panel:#0b0b0d; --text:#fff; --muted:#9aa0a6; --line:rgba(255,255,255,.09); --ok:#00ff66; --warn:#ffcc00; --bad:#ff3b5c; }
+  body { background:var(--bg); color:var(--text); font-family:-apple-system,"Segoe UI",system-ui,sans-serif; line-height:1.55; padding:40px 24px 80px; }
+  .wrap { max-width:760px; margin:0 auto; }
+  h1 { font-size:1.5rem; letter-spacing:-.02em; color:var(--pink); margin-bottom:6px; }
+  .sub { color:var(--muted); font-size:.86rem; margin-bottom:24px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  label { font-size:.68rem; text-transform:uppercase; letter-spacing:.1em; color:var(--pink); opacity:.85; display:block; margin-bottom:6px; }
+  input[type=text] { flex:1 1 240px; min-width:0; background:#141417; border:1px solid var(--line); border-radius:7px; color:var(--text); padding:9px 11px; font-family:"SF Mono","Fira Code",ui-monospace,monospace; font-size:.8rem; }
+  input:focus { outline:none; border-color:var(--pink); }
+  button { background:var(--pink); color:#fff; border:0; border-radius:7px; padding:9px 14px; font-size:.8rem; font-weight:600; cursor:pointer; }
+  button:hover { filter:brightness(1.12); }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--muted); font-weight:500; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  h2 { font-size:.7rem; font-weight:700; letter-spacing:.12em; text-transform:uppercase; color:var(--pink); opacity:.8; margin-bottom:10px; }
+  .meta { font-family:"SF Mono","Fira Code",ui-monospace,monospace; font-size:.74rem; color:var(--muted); margin-bottom:10px; word-break:break-all; }
+  .slider { position:relative; margin-top:10px; }
+  .stage { position:relative; width:100%; border-radius:8px; overflow:hidden; background:#141417; touch-action:none; user-select:none; line-height:0; }
+  .stage img.bg { width:100%; display:block; }
+  .piece { position:absolute; filter:drop-shadow(0 0 6px rgba(0,0,0,.7)); pointer-events:none; }
+  .track { position:relative; height:38px; margin-top:10px; border-radius:19px; background:#141417; border:1px solid var(--line); }
+  .track .fill { position:absolute; inset:0 auto 0 0; width:0; border-radius:19px 0 0 19px; background:rgba(232,23,93,.18); }
+  .thumb { position:absolute; top:2px; left:0; width:44px; height:32px; border-radius:16px; background:var(--pink); display:flex; align-items:center; justify-content:center; font-weight:700; cursor:grab; touch-action:none; }
+  .thumb:active { cursor:grabbing; }
+  .status { font-size:.8rem; margin-top:10px; color:var(--muted); min-height:1.2em; }
+  .status.ok { color:var(--ok); }
+  .status.bad { color:var(--bad); }
+  .status.warn { color:var(--warn); }
+  .empty { color:var(--muted); font-size:.84rem; }
+  .pill { display:inline-block; font-size:.68rem; font-family:"SF Mono","Fira Code",ui-monospace,monospace; padding:1px 7px; border-radius:4px; background:rgba(255,255,255,.08); color:var(--muted); margin-left:6px; }
+  .pill.session { background:rgba(0,255,102,.14); color:var(--ok); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Registration puzzle</h1>
+  <p class="sub">Raccoon gates new accounts behind a slider. Your server holds the session, so the puzzle is solved here and relayed back — one solve authorises exactly one address.</p>
+
+  <div class="panel">
+    <label for="base">API host</label>
+    <div class="row">
+      <input type="text" id="base" spellcheck="false">
+      <button id="reload" class="ghost">Refresh list</button>
+    </div>
+    <div class="hint" style="margin-top:12px">
+      API key <input type="text" id="key" placeholder="auto-filled from /cloud/v1/config" spellcheck="false" style="display:block;width:100%;margin-top:6px">
+    </div>
+    <div class="meta" id="pollState" style="margin-top:10px">waiting…</div>
+  </div>
+
+  <div class="panel" id="puzzlePanel" style="display:none">
+    <h2>Solve this puzzle</h2>
+    <div class="meta" id="puzzleMeta"></div>
+    <div class="slider">
+      <div class="stage" id="stage">
+        <img class="bg" id="bg" alt="">
+        <img class="piece" id="piece" alt="">
+      </div>
+      <div class="track" id="track">
+        <div class="fill" id="fill"></div>
+        <div class="thumb" id="thumb">&#8250;</div>
+      </div>
+    </div>
+    <div class="status" id="status">Drag the piece to the gap, then release.</div>
+  </div>
+
+  <div class="panel">
+    <h2>Pending</h2>
+    <div id="pending" class="empty">Nothing waiting.</div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  $("base").value = location.origin;
+
+  let apiKey = "";
+  let puzzle = null;      // the challenge currently on screen
+  let progress = 0;
+  let dragging = false;
+  let startX = 0, startProgress = 0, submitting = false;
+
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const base = () => $("base").value.trim().replace(/\/+$/, "");
+  const auth = () => ({ "x-api-key": apiKey });
+
+  function setStatus(text, cls) {
+    $("status").textContent = text;
+    $("status").className = "status" + (cls ? " " + cls : "");
+  }
+
+  async function ensureKey() {
+    if (apiKey) return true;
+    const typed = $("key").value.trim();
+    if (typed) { apiKey = typed; return true; }
+    try {
+      const r = await fetch(base() + "/cloud/v1/config");
+      const j = await r.json();
+      const k = j?.sites?.[0]?.api_key;
+      if (k) { apiKey = k; $("key").value = k; return true; }
+    } catch {}
+    return false;
+  }
+
+  /** The piece is placed by progress, and the offset the server wants is the
+   *  same fraction of the source width — that is how Raccoon's own widget maps
+   *  a drag onto an answer. */
+  function offsetFor(p) {
+    const c = puzzle.challenge;
+    const sourceMax = Math.max(1, c.width - c.piece_size);
+    return Math.round(p * sourceMax);
+  }
+
+  // The piece is drawn at the same fraction of the stage that its source x is of
+  // the source width, and the offset Raccoon wants is that same fraction of the
+  // source width — which is how their own widget maps a drag onto an answer.
+  function render() {
+    const c = puzzle.challenge;
+    const stageW = $("stage").clientWidth || 1;
+    const pieceW = stageW * (c.piece_size / c.width);
+    const renderedMax = Math.max(0, stageW - pieceW);
+    $("piece").style.width = pieceW + "px";
+    $("piece").style.height = pieceW + "px";
+    $("piece").style.top = (stageW * (c.piece_y / c.width)) + "px";
+    $("piece").style.left = (progress * renderedMax) + "px";
+    const trackMax = Math.max(1, $("track").clientWidth - $("thumb").clientWidth - 4);
+    $("thumb").style.left = (progress * trackMax) + "px";
+    $("fill").style.width = (progress * trackMax + 22) + "px";
+  }
+
+  function showPuzzle(p) {
+    puzzle = p;
+    progress = 0;
+    const c = p.challenge;
+    $("bg").src = c.background;
+    $("piece").src = c.piece;
+    $("piece").style.opacity = "0";
+    $("bg").onload = () => { $("piece").style.opacity = "1"; render(); };
+    $("puzzleMeta").innerHTML =
+      "email <b>" + esc(p.email) + "</b>" + (p.session ? '<span class="pill session">session ' + esc(String(p.session).slice(0, 8)) + "</span>" : '<span class="pill">pool</span>') +
+      "<br>challenge " + esc(c.challenge_id) + " · " + c.width + "×" + c.height + " · piece " + c.piece_size +
+      " · expires in " + p.expires_in_seconds + "s";
+    $("puzzlePanel").style.display = "block";
+    $("thumb").style.left = "0";
+    setStatus("Drag the piece to the gap, then release.", "");
+    render();
+  }
+
+  function clearPuzzle() {
+    puzzle = null;
+    $("puzzlePanel").style.display = "none";
+  }
+
+  async function poll() {
+    if (!(await ensureKey())) {
+      $("pollState").textContent = "no API key — paste one above";
+      return;
+    }
+    if (submitting) return;
+    try {
+      const r = await fetch(base() + "/cloud/v1/puzzles", { headers: auth() });
+      if (!r.ok) {
+        $("pollState").textContent = "GET /cloud/v1/puzzles → HTTP " + r.status;
+        return;
+      }
+      const j = await r.json();
+      const list = j.puzzles || [];
+      $("pollState").textContent = list.length
+        ? list.length + " puzzle(s) waiting"
+        : "no puzzle waiting — start a session and one will appear here";
+      $("pending").innerHTML = list.length
+        ? list.map((p) => '<div class="meta">' + esc(p.email) + " · " + esc(p.id.slice(0, 8)) +
+            (p.session ? ' · <span class="pill session">session ' + esc(String(p.session).slice(0, 8)) + "</span>" : ' · <span class="pill">pool</span>') +
+            " · " + p.age_seconds + "s old</div>").join("")
+        : '<span class="empty">Nothing waiting.</span>';
+
+      // A client that just launched a session wants *its* puzzle, so honour
+      // ?session=<uuid> when it is present and still waiting.
+      const wanted = new URLSearchParams(location.search).get("session");
+      const pick = (wanted && list.find((p) => p.session === wanted)) || list[0];
+
+      // Keep the on-screen puzzle if it is still valid, else take the pick.
+      const still = list.find((p) => puzzle && p.id === puzzle.id);
+      if (still && (!pick || still.id === pick.id)) {
+        puzzle.expires_in_seconds = still.expires_in_seconds;
+      } else if (pick) showPuzzle(pick);
+      else clearPuzzle();
+    } catch (err) {
+      $("pollState").textContent = "poll failed: " + err.message;
+    }
+  }
+
+  async function submit() {
+    if (!puzzle || submitting) return;
+    const offset = offsetFor(progress);
+    submitting = true;
+    setStatus("Checking offset " + offset + "…", "warn");
+    try {
+      const r = await fetch(base() + "/cloud/v1/puzzles/" + encodeURIComponent(puzzle.id), {
+        method: "POST",
+        headers: { ...auth(), "Content-Type": "application/json" },
+        body: JSON.stringify({ offset }),
+      });
+      const text = await r.text();
+      let msg = text;
+      try { msg = JSON.parse(text).error || text; } catch {}
+      if (r.ok) {
+        setStatus("Accepted — the account continues.", "ok");
+        clearPuzzle();
+      } else if (r.status === 422) {
+        // The challenge is spent, so the poll below pulls a fresh one.
+        clearPuzzle();
+        setStatus("Wrong position — Raccoon rejected that offset. Loading a new puzzle…", "bad");
+      } else {
+        setStatus("Failed (HTTP " + r.status + "): " + String(msg).slice(0, 160), "bad");
+      }
+    } catch (err) {
+      setStatus("Submit failed: " + err.message, "bad");
+    } finally {
+      submitting = false;
+      setTimeout(poll, 800);
+    }
+  }
+
+  function progressFrom(clientX) {
+    const trackMax = Math.max(1, $("track").clientWidth - $("thumb").clientWidth - 4);
+    const dx = clientX - startX;
+    return Math.max(0, Math.min(1, startProgress + dx / trackMax));
+  }
+
+  const thumb = $("thumb");
+  thumb.addEventListener("pointerdown", (e) => {
+    if (!puzzle) return;
+    dragging = true;
+    startX = e.clientX;
+    startProgress = progress;
+    thumb.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+  thumb.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    progress = progressFrom(e.clientX);
+    render();
+  });
+  thumb.addEventListener("pointerup", (e) => {
+    if (!dragging) return;
+    dragging = false;
+    try { thumb.releasePointerCapture(e.pointerId); } catch {}
+    if (progress <= 0.01) { setStatus("Drag the piece to the gap first.", "warn"); return; }
+    submit();
+  });
+  thumb.addEventListener("pointercancel", () => { dragging = false; });
+  window.addEventListener("resize", () => { if (puzzle) render(); });
+  $("reload").addEventListener("click", poll);
+
+  poll();
+  setInterval(() => { if (!dragging && !submitting) poll(); }, 3000);
+})();
+</script>
+</body>
+</html>

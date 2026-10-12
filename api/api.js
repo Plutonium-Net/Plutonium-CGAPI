@@ -1,6 +1,7 @@
 const express = require("express");
 const { randomUUID, createDecipheriv } = require("crypto");
 const { readFileSync } = require("fs");
+const os = require("os");
 const { WebSocketServer, WebSocket } = require("ws");
 const { createServer } = require("http");
 const dns = require("dns");
@@ -71,20 +72,57 @@ async function fetchWithTimeout(url, opts = {}, ms = RACCOON_TIMEOUT_MS) {
   }
 }
 
-async function raccoonFetch(pathAndQuery, opts = {}) {
-  const entry = await resolveRaccoonIp();
-  if (!entry)
-    return fetchWithTimeout(`https://${RACCOON_HOST}${pathAndQuery}`, opts);
-  const authority = entry.family === 6 ? `[${entry.ip}]` : entry.ip;
-  try {
-    return await fetchWithTimeout(`https://${authority}${pathAndQuery}`, {
-      ...opts,
-      headers: { ...opts.headers, Host: RACCOON_HOST },
-    });
-  } catch {
-    raccoonIpCache = null;
-    return fetchWithTimeout(`https://${RACCOON_HOST}${pathAndQuery}`, opts);
+// Raccoon's registration puzzle is bound to the PHP session that requested it,
+// so an account being created has to carry that session's cookies between
+// calls. fetch keeps no cookie state, so the caller passes a jar explicitly.
+function newRaccoonJar() {
+  return { cookies: new Map() };
+}
+
+function jarCookieHeader(jar) {
+  if (!jar || jar.cookies.size === 0) return undefined;
+  return [...jar.cookies].map(([k, v]) => `${k}=${v}`).join("; ");
+}
+
+function absorbCookies(jar, res) {
+  if (!jar || typeof res.headers.getSetCookie !== "function") return;
+  for (const raw of res.headers.getSetCookie()) {
+    const pair = raw.split(";")[0];
+    const eq = pair.indexOf("=");
+    if (eq > 0) jar.cookies.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
   }
+}
+
+async function raccoonFetch(pathAndQuery, opts = {}) {
+  const { jar, ...init } = opts;
+  const cookie = jarCookieHeader(jar);
+  const headers = cookie
+    ? { ...init.headers, Cookie: cookie }
+    : { ...init.headers };
+  const entry = await resolveRaccoonIp();
+  let res;
+  if (!entry) {
+    res = await fetchWithTimeout(`https://${RACCOON_HOST}${pathAndQuery}`, {
+      ...init,
+      headers,
+    });
+  } else {
+    const authority = entry.family === 6 ? `[${entry.ip}]` : entry.ip;
+    try {
+      res = await fetchWithTimeout(`https://${authority}${pathAndQuery}`, {
+        ...init,
+        headers: { ...headers, Host: RACCOON_HOST },
+      });
+    } catch {
+      raccoonIpCache = null;
+      res = await fetchWithTimeout(`https://${RACCOON_HOST}${pathAndQuery}`, {
+        ...init,
+        headers,
+      });
+    }
+  }
+  absorbCookies(jar, res);
+  return res;
 }
 
 const sessions = new Map();
@@ -119,36 +157,269 @@ function generatePassword() {
   return p;
 }
 
-async function getVerificationCode(mailJwt, maxRetries = 30) {
-  const headers = {
-    Authorization: `Bearer ${mailJwt}`,
-    "Content-Type": "application/json",
-  };
-  for (let i = 0; i < maxRetries; i++) {
-    await new Promise((r) => setTimeout(r, 3000));
-    try {
-      const res = await fetchWithTimeout("https://api.mail.tm/messages?page=1", {
-        headers,
-      });
-      const data = await res.json();
-      if (data["hydra:member"]?.length > 0) {
-        const msgId = data["hydra:member"][0].id;
-        const full = await (
-          await fetchWithTimeout(`https://api.mail.tm/messages/${msgId}`, {
-            headers,
-          })
-        ).json();
-        const match = (full.text || full.html || "")
-          .replace(/<[^>]*>/g, "")
-          .match(/\b\d{6}\b/);
-        if (match) return match[0];
-      }
-    } catch {}
+// malq is Plutonium's self-hosted disposable mail service (see README). It
+// hands out an inbox on demand and needs no credentials. mail.tm is no longer
+// usable for registrations: Raccoon refuses its single domain as a temporary
+// address, while malq's provider domains are accepted.
+const MAIL_HOST = process.env.MALQ_URL || "http://127.0.0.1:4400";
+const MAIL_TIMEOUT_MS = 10_000;
+
+async function mailFetch(pathAndQuery, opts = {}, ms = MAIL_TIMEOUT_MS) {
+  let res;
+  try {
+    res = await fetchWithTimeout(`${MAIL_HOST}${pathAndQuery}`, opts, ms);
+  } catch (cause) {
+    const err = new Error(
+      `malq unavailable at ${MAIL_HOST}: ${cause?.message || cause}`,
+    );
+    err.service = "malq";
+    throw err;
   }
-  throw new Error("Timeout getting verification code");
+  const body = await res.text();
+  if (!res.ok) {
+    let detail = body.slice(0, 160);
+    try {
+      const parsed = JSON.parse(body);
+      if (parsed?.error) detail = parsed.error;
+    } catch {}
+    throw new Error(
+      `malq ${pathAndQuery.split("?")[0]} → HTTP ${res.status} ${detail}`,
+    );
+  }
+  try {
+    return JSON.parse(body);
+  } catch {
+    throw new Error(`malq ${pathAndQuery.split("?")[0]} returned non-JSON`);
+  }
 }
 
-const POOL_TARGET = 5;
+// Raccoon's mail puts the code next to the word "code"; a mail that only carries
+// a bare number is matched as a standalone token, so unrelated six-digit values
+// embedded in markup are not mistaken for the code.
+function extractVerificationCode(text) {
+  const labelled = text.match(
+    /(?:verification\s*code|验证码|verification|code)\D{0,24}?(\d{6})\b/i,
+  );
+  if (labelled) return labelled[1];
+  const bare = text.match(/(?:^|[\s>])(\d{6})(?:\s|$)/);
+  return bare ? bare[1] : null;
+}
+
+// Polls the malq inbox for Raccoon's 6-digit code. A provider that fails on
+// every poll would otherwise burn the whole window silently, so the last error
+// is carried into the timeout message.
+async function getVerificationCode(mailToken, maxAttempts = 40) {
+  let lastError = null;
+  let announced = false;
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise((r) => setTimeout(r, 3000));
+    try {
+      const { mail } = await mailFetch(
+        `/api/v1/inbox/${encodeURIComponent(mailToken)}`,
+      );
+      const messages = Array.isArray(mail) ? mail : [];
+      if (messages.length && !announced) {
+        // Worth knowing separately from the code: mail arriving but the code
+        // not parsing is a very different bug from mail never arriving.
+        announced = true;
+        logSys(chalk.gray(`mail: ${messages.length} message(s) arrived`));
+      }
+      for (const msg of messages.slice(0, 10)) {
+        const subject = String(msg?.subject ?? "");
+        const text = [subject, String(msg?.body ?? "")]
+          .join(" ")
+          .replace(/<[^>]*>/g, " ")
+          .replace(/&nbsp;/g, " ");
+        const code = extractVerificationCode(text);
+        if (code) {
+          logSys(chalk.gray(`mail: code found in "${subject.slice(0, 48)}"`));
+          return code;
+        }
+        // A message that arrives without a parseable code is a different bug
+        // from one that never arrives, so show what it actually contained.
+        logSys(
+          chalk.yellow(
+            `mail: no 6-digit code in "${subject.slice(0, 48)}" — ` +
+              text.replace(/\s+/g, " ").trim().slice(0, 140),
+          ),
+        );
+      }
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw new Error(
+    "Timeout getting verification code" +
+      (lastError ? ` (${lastError.message})` : ""),
+  );
+}
+
+// Raccoon gates registration behind a slide-the-piece puzzle. The solved state
+// is bound to the PHP session cookie *and* to the exact email+sn that requested
+// the challenge, so only the same HTTP client can complete it — the server, not
+// the end user's browser. So the server fetches the challenge, hands the two
+// images to a human, and relays their answer back upstream. One solve
+// authorises exactly one address, so puzzles are raised on demand.
+const PUZZLE_TIMEOUT_MS = 10 * 60_000;
+const pendingPuzzles = new Map(); // id -> { id, session, email, challenge, resolve }
+
+function isPuzzleRefusal(text) {
+  return /puzzle verification/i.test(text || "");
+}
+
+// Fetches a challenge on this jar's session and parks it for a human, invoking
+// onPuzzle so whoever is streaming the session can render it. Resolves with the
+// offset once the human's answer has been relayed upstream and accepted.
+async function completePuzzle({
+  jar,
+  email,
+  sn,
+  headers,
+  onPuzzle,
+  sessionUuid,
+}) {
+  const qs = new URLSearchParams({
+    email,
+    type: "register",
+    sn,
+    t: String(Date.now()),
+  });
+  const cRes = await raccoonFetch(`/users/emailRegisterCaptcha?${qs}`, { jar });
+  const cBody = await cRes.json().catch(() => null);
+  const challenge = cBody?.data;
+  if (!challenge?.challenge_id) {
+    throw new Error(
+      `puzzle challenge unavailable — HTTP ${cRes.status} ${cBody?.msg || ""}`.trim(),
+    );
+  }
+
+  const id = randomUUID();
+  // Whoever submitted the offset is told the *upstream* verdict, not just that
+  // the answer was received — "puzzle does not match" is the whole point.
+  let settleVerdict;
+  const verdict = new Promise((resolve) => {
+    settleVerdict = resolve;
+  });
+  const entry = {
+    id,
+    session: sessionUuid || null,
+    email,
+    challenge,
+    created_at: Date.now(),
+    verdict,
+    settle: (v) => settleVerdict(v),
+  };
+  pendingPuzzles.set(id, entry);
+  logSys(
+    chalk.yellow(`puzzle required → ${chalk.white(id.slice(0, 8))} · ${email}`),
+  );
+
+  let offset;
+  try {
+    offset = await new Promise((resolve, reject) => {
+      entry.resolve = resolve;
+      entry.timer = setTimeout(() => {
+        pendingPuzzles.delete(id);
+        reject(new Error("puzzle solve timed out"));
+      }, PUZZLE_TIMEOUT_MS);
+      entry.timer.unref?.();
+      onPuzzle?.(entry);
+    });
+  } catch (e) {
+    entry.settle({ ok: false, message: e.message });
+    throw e;
+  } finally {
+    clearTimeout(entry.timer);
+    pendingPuzzles.delete(id);
+  }
+
+  try {
+    const vRes = await raccoonFetch("/users/emailRegisterCaptchaVerify", {
+      method: "POST",
+      jar,
+      headers,
+      body: new URLSearchParams({
+        email,
+        type: "register",
+        sn,
+        challenge_id: challenge.challenge_id,
+        offset: String(offset),
+      }),
+    });
+    const vBody = await vRes.json().catch(() => null);
+    if (vBody?.status !== 200) {
+      const message = vBody?.msg || `HTTP ${vRes.status}`;
+      entry.settle({ ok: false, message });
+      throw new Error(`puzzle rejected — ${message}`);
+    }
+    entry.settle({ ok: true, message: "Raccoon accepted the offset." });
+    logSys(chalk.green(`puzzle solved → ${chalk.white(id.slice(0, 8))}`));
+    return offset;
+  } catch (e) {
+    entry.settle({ ok: false, message: e.message });
+    throw e;
+  }
+}
+
+// Sends the registration email, completing the puzzle gate once if Raccoon asks
+// for it. Raccoon answers HTTP 200 even when it refuses, so the body's own
+// `status` is the real outcome.
+async function requestRegistrationEmail({
+  jar,
+  email,
+  sn,
+  base,
+  headers,
+  onPuzzle,
+  sessionUuid,
+}) {
+  const attempt = async () => {
+    const res = await raccoonFetch("/users/sendEmail", {
+      method: "POST",
+      jar,
+      headers,
+      body: new URLSearchParams({ email, type: "register", ...base }),
+    });
+    const raw = await res.text();
+    let data = null;
+    try {
+      data = JSON.parse(raw);
+    } catch {}
+    return { res, raw, data };
+  };
+
+  let { res, raw, data } = await attempt();
+
+  // A human's drag can land wrong, and Raccoon then refuses that challenge for
+  // good — so raise a fresh one instead of losing the whole account flow.
+  const MAX_PUZZLE_TRIES = 3;
+  for (let tries = 0; tries < MAX_PUZZLE_TRIES; tries++) {
+    if (!isPuzzleRefusal(data?.msg) && !isPuzzleRefusal(raw)) break;
+    try {
+      await completePuzzle({ jar, email, sn, headers, onPuzzle, sessionUuid });
+    } catch (e) {
+      logSys(chalk.red(`puzzle: attempt ${tries + 1} failed — ${e.message}`));
+      if (tries === MAX_PUZZLE_TRIES - 1) throw e;
+      continue; // the next pass fetches a fresh challenge
+    }
+    ({ res, raw, data } = await attempt());
+  }
+
+  if (
+    !res.ok ||
+    (data && typeof data.status === "number" && data.status !== 200)
+  ) {
+    throw new Error(
+      `sendEmail rejected — HTTP ${res.status}` +
+        (data?.msg ? ` · ${data.msg}` : ` · ${raw.slice(0, 160)}`),
+    );
+  }
+  return data;
+}
+
+// Every pooled account now needs a human to drag its registration puzzle, so a
+// pool that nobody is watching only ever accumulates unsolvable prompts.
+const POOL_TARGET = Math.max(0, Number(process.env.POOL_TARGET ?? 5) || 0);
 const pool = [];
 let poolFilling = false;
 
@@ -173,7 +444,7 @@ async function fillPool() {
   }
 }
 
-async function createAccount() {
+async function createAccount(opts = {}) {
   if (pool.length > 0) {
     const acc = pool.shift();
     logSys(chalk.gray(`pool: served account (${pool.length} remaining)`));
@@ -181,39 +452,144 @@ async function createAccount() {
     return acc;
   }
   logSys(chalk.gray("pool: miss — creating account on demand"));
-  const acc = await createAccountRaw();
+  const acc = await createAccountRaw(opts);
   fillPool().catch(() => {});
   return acc;
 }
 
-async function createAccountRaw() {
-  const domainData = await (
-    await fetchWithTimeout("https://api.mail.tm/domains")
-  ).json();
-  if (!domainData["hydra:member"]?.length)
-    throw new Error("No Mail.tm domains available");
-  const domain = domainData["hydra:member"][0].domain;
+// Raccoon refuses disposable domains outright — but only *after* the puzzle, so
+// a blocked address throws away a human's solve. Pre-screen against the public
+// disposable-domain blocklist; the list is optional, and if it cannot be read
+// the check is skipped rather than blocking account creation.
+const DISPOSABLE_LIST_URL =
+  process.env.DISPOSABLE_LIST_URL ||
+  "https://raw.githubusercontent.com/disposable-email-domains/disposable-email-domains/master/disposable_email_blocklist.conf";
+const DISPOSABLE_LIST_FILE =
+  process.env.DISPOSABLE_LIST_FILE ||
+  path.join(os.tmpdir(), "plutonium-disposable-domains.txt");
+let disposableDomains = null;
 
-  const mailUser = `rcn_${Math.random().toString(36).substring(2, 11)}`;
-  const email = `${mailUser}@${domain}`;
-  const mailPassword = generatePassword();
+async function getDisposableDomains() {
+  if (disposableDomains) return disposableDomains;
+  let text = null;
+  try {
+    text = readFileSync(DISPOSABLE_LIST_FILE, "utf-8");
+  } catch {
+    try {
+      const res = await fetchWithTimeout(DISPOSABLE_LIST_URL, {}, 10_000);
+      text = await res.text();
+    } catch (e) {
+      logSys(
+        chalk.yellow(
+          `mail: disposable-domain list unavailable (${e.message}) — skipping that check`,
+        ),
+      );
+      disposableDomains = new Set();
+      return disposableDomains;
+    }
+  }
+  disposableDomains = new Set(
+    text
+      .split(/\s+/)
+      .map((d) => d.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  logSys(
+    chalk.gray(`mail: disposable-domain list loaded (${disposableDomains.size})`),
+  );
+  return disposableDomains;
+}
+
+// malq's provider pools include domains with no MX record at all, and a mailbox
+// on one of those can never receive Raccoon's code; others are on Raccoon's
+// blocklist. Ask for an address that clears both before spending a solve on it.
+async function mailSessionWithDeliverableDomain(providerQs, tries = 6) {
+  let blockedButDeliverable = null;
+  let last = null;
+  let lastError = null;
+  for (let i = 0; i < tries; i++) {
+    let box;
+    try {
+      box = await mailFetch(`/api/v1/session${providerQs}`);
+    } catch (e) {
+      // Providers fail transiently (upstream 500s, provider-side WAF); that is
+      // not a reason to abort a launch that has not started yet.
+      lastError = e;
+      logSys(chalk.yellow(`mail: ${e.message} — trying again`));
+      continue;
+    }
+    if (!box?.address || !box?.token) throw new Error("malq returned no session");
+    last = box;
+    const domain = String(box.address).split("@")[1] || "";
+    // Some provider pools are full of junk ("name@undefined", reverse-DNS arpa
+    // names), so require something that is even a plausible mail domain before
+    // spending a DNS lookup on it.
+    const plausible =
+      /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i.test(
+        domain,
+      ) && !/\.arpa$/i.test(domain);
+    if (!plausible) {
+      logSys(chalk.yellow(`mail: malq offered ${box.address} — asking again`));
+      continue;
+    }
+    try {
+      const mx = await dns.promises.resolveMx(domain);
+      if (!mx?.length) throw Object.assign(new Error("no MX"), { code: "ENOTFOUND" });
+    } catch (e) {
+      logSys(
+        chalk.yellow(
+          `mail: ${domain} cannot receive mail (${e.code || e.message}) — asking malq again`,
+        ),
+      );
+      continue;
+    }
+    if ((await getDisposableDomains()).has(domain)) {
+      logSys(
+        chalk.yellow(
+          `mail: ${domain} is on the disposable blocklist — asking malq again`,
+        ),
+      );
+      blockedButDeliverable = blockedButDeliverable || box;
+      continue;
+    }
+    return box;
+  }
+  if (blockedButDeliverable) {
+    logSys(
+      chalk.yellow(
+        `mail: only blocklisted domains on offer; using ${blockedButDeliverable.address} anyway`,
+      ),
+    );
+    return blockedButDeliverable;
+  }
+  if (!last) throw lastError || new Error("malq returned no inbox");
+  logSys(
+    chalk.yellow(
+      `mail: no deliverable domain in ${tries} tries — using ${last.address}`,
+    ),
+  );
+  return last;
+}
+
+async function createAccountRaw(opts = {}) {
+  // The jar carries the Raccoon session across the mailbox, puzzle and register
+  // calls; a puzzle solved here only counts for this jar and this email.
+  const jar = opts.jar || newRaccoonJar();
+  // malq picks the provider and creates the inbox itself, unlike mail.tm which
+  // needed a domain lookup, an account and a token before mail could arrive.
+  // malq has one provider per domain and Raccoon refuses some of those domains
+  // outright, so pin the accepted one instead of gambling on a random pick.
+  const providerQs = process.env.MALQ_PROVIDER
+    ? `?provider=${encodeURIComponent(process.env.MALQ_PROVIDER)}`
+    : "";
+  const box = await mailSessionWithDeliverableDomain(providerQs);
+  const email = box?.address;
+  const mailToken = box?.token;
+  if (!email || !mailToken) throw new Error("malq returned no session");
+  logSys(chalk.gray(`mail: ${email} · ${box.provider || "unknown provider"}`));
+
   const raccoonPassword = generatePassword();
   const sn = generateSN();
-
-  const regRes = await fetchWithTimeout("https://api.mail.tm/accounts", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ address: email, password: mailPassword }),
-  });
-  if (!regRes.ok) throw new Error("Failed to register Mail.tm mailbox");
-
-  const tokenRes = await fetchWithTimeout("https://api.mail.tm/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ address: email, password: mailPassword }),
-  });
-  if (!tokenRes.ok) throw new Error("Failed to get Mail.tm token");
-  const { token: mailJwt } = await tokenRes.json();
 
   const h = {
     "Content-Type": "application/x-www-form-urlencoded",
@@ -229,38 +605,23 @@ async function createAccountRaw() {
     os: "web",
   };
 
-  // Raccoon answers HTTP 200 even when it refuses the request — the real
-  // outcome is the `status` in the JSON body. Checking only the HTTP status
-  // (or nothing at all) makes a refused send indistinguishable from a slow
-  // mailbox: the code then waits out the whole 90s verification window and
-  // reports "Timeout getting verification code", which points at the mail
-  // provider instead of at the actual rejection.
-  const sendRes = await raccoonFetch("/users/sendEmail", {
-    method: "POST",
+  await requestRegistrationEmail({
+    jar,
+    email,
+    sn,
+    base,
     headers: h,
-    body: new URLSearchParams({ email, type: "register", ...base }),
+    onPuzzle: opts.onPuzzle,
+    sessionUuid: opts.sessionUuid,
   });
-  const sendBody = await sendRes.text();
-  let sendData = null;
-  try {
-    sendData = JSON.parse(sendBody);
-  } catch {}
-  if (
-    !sendRes.ok ||
-    (sendData && typeof sendData.status === "number" && sendData.status !== 200)
-  ) {
-    throw new Error(
-      `sendEmail rejected — HTTP ${sendRes.status}` +
-        (sendData?.msg
-          ? ` · ${sendData.msg}`
-          : ` · ${sendBody.slice(0, 160)}`),
-    );
-  }
 
-  const code = await getVerificationCode(mailJwt);
+  const code = await getVerificationCode(mailToken);
 
-  await raccoonFetch("/users/emailRegister", {
+  // The register reply is the only place a rejected code shows up; ignoring it
+  // made every failure surface one step later as a bare "Login failed".
+  const regRes = await raccoonFetch("/users/emailRegister", {
     method: "POST",
+    jar,
     headers: h,
     body: new URLSearchParams({
       email,
@@ -271,9 +632,20 @@ async function createAccountRaw() {
       ...base,
     }),
   });
+  const regBody = await regRes.json().catch(() => null);
+  if (
+    regRes.status !== 200 ||
+    (regBody && typeof regBody.status === "number" && regBody.status !== 200)
+  ) {
+    throw new Error(
+      `registration rejected — HTTP ${regRes.status}` +
+        (regBody?.msg ? ` · ${regBody.msg}` : ` · code ${code}`),
+    );
+  }
 
   const loginRes = await raccoonFetch("/users/emailLogin", {
     method: "POST",
+    jar,
     headers: h,
     body: new URLSearchParams({ email, password: raccoonPassword, ...base }),
   });
@@ -650,9 +1022,17 @@ setInterval(() => {
       continue;
     }
     const deadline = REAPER_DEADLINES[session.state];
-    if (deadline !== undefined && now - session.created_at > deadline) {
-      killSession(uuid, `reaper:${session.state}_deadline`);
-      continue;
+    if (deadline !== undefined) {
+      // A human dragging this session's registration puzzle — and the mailbox
+      // wait that follows — legitimately outlives ordinary account creation, so
+      // a session that raised a puzzle gets the puzzle window on top.
+      const budget = session.puzzle_raised_at
+        ? deadline + PUZZLE_TIMEOUT_MS
+        : deadline;
+      if (now - session.created_at > budget) {
+        killSession(uuid, `reaper:${session.state}_deadline`);
+        continue;
+      }
     }
     if (session.state === "active" && !session.session_timeout) {
       killSession(uuid, "reaper:active_no_timeout");
@@ -817,6 +1197,11 @@ app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
+// The human side of the registration puzzle (see /cloud/v1/puzzles).
+app.get("/puzzle", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "puzzle.html"));
+});
+
 app.get("/cloud/v1/config", (req, res) => {
   const enabledSites = Object.entries(sites.sites)
     .filter(([_, cfg]) => cfg.enabled)
@@ -850,6 +1235,51 @@ app.get("/cloud/v1/embed-data", (req, res) => {
     ice_servers: session.embed_ice_servers,
     signaling_ws: session.embed_signaling_ws,
   });
+});
+
+// Human-in-the-loop registration puzzles. A puzzle blocks one account's
+// creation until someone drags the slider: list to see what is waiting, then
+// submit the offset. The waiting account flow relays it upstream and reports
+// whether Raccoon accepted it.
+app.get("/cloud/v1/puzzles", auth, (req, res) => {
+  const now = Date.now();
+  res.json({
+    puzzles: [...pendingPuzzles.values()].map((p) => ({
+      id: p.id,
+      session: p.session,
+      email: p.email,
+      age_seconds: Math.floor((now - p.created_at) / 1000),
+      expires_in_seconds: Math.max(
+        0,
+        Math.floor((PUZZLE_TIMEOUT_MS - (now - p.created_at)) / 1000),
+      ),
+      challenge: p.challenge,
+    })),
+  });
+});
+
+app.post("/cloud/v1/puzzles/:id", auth, async (req, res) => {
+  const puzzle = pendingPuzzles.get(req.params.id);
+  if (!puzzle)
+    return res.status(404).json({ error: "Puzzle not found or expired." });
+
+  const offset = Number(req.body?.offset);
+  if (!Number.isInteger(offset) || offset < 0)
+    return res.status(400).json({ error: "Invalid offset." });
+
+  logApi(
+    req.apiKey,
+    `${chalk.gray("puzzle")} ${chalk.white(puzzle.id.slice(0, 8))} offset ${offset}`,
+  );
+  // Hand the answer to the account flow that is waiting on it, then wait for
+  // Raccoon's own verdict so the solver learns whether the drag was right.
+  puzzle.resolve(offset);
+  const verdict = await puzzle.verdict;
+  if (!verdict.ok)
+    return res
+      .status(422)
+      .json({ error: `Raccoon rejected the solve: ${verdict.message}` });
+  res.json({ status: "ok", message: verdict.message });
 });
 
 app.post("/cloud/v1/createSession", auth, async (req, res) => {
@@ -905,6 +1335,7 @@ app.post("/cloud/v1/createSession", auth, async (req, res) => {
     max_session_seconds: sessionLimit,
     last_queue_poll_at: null,
     last_ping_at: null,
+    puzzle_raised_at: null,
     startgame_timeout: null,
     queue_abandon_timeout: null,
     ping_timeout: null,
@@ -922,7 +1353,25 @@ app.post("/cloud/v1/createSession", auth, async (req, res) => {
 
   try {
     push({ status: "creating_account" });
-    const acc = await createAccount();
+    const acc = await createAccount({
+      sessionUuid: uuid,
+      onPuzzle: (entry) => {
+        // A human is on the clock now, so the reaper grants this session the
+        // puzzle window on top of its ordinary creation budget.
+        session.puzzle_raised_at = Date.now();
+        push({
+          status: "puzzle_required",
+          uuid,
+          solve_within_seconds: Math.floor(PUZZLE_TIMEOUT_MS / 1000),
+          puzzle: {
+            id: entry.id,
+            email: entry.email,
+            challenge: entry.challenge,
+          },
+          submit_to: `/cloud/v1/puzzles/${entry.id}`,
+        });
+      },
+    });
 
     releaseAccountSlot(apiKey);
 

@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Plutonium-CGAPI — host probe</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root { --pink:#e8175d; --bg:#000; --panel:#0b0b0d; --text:#fff; --muted:#9aa0a6; --line:rgba(255,255,255,.09); --ok:#00ff66; --warn:#ffcc00; --bad:#ff3b5c; }
+  body { background:var(--bg); color:var(--text); font-family:-apple-system,"Segoe UI",system-ui,sans-serif; line-height:1.55; padding:40px 24px 80px; }
+  .wrap { max-width:940px; margin:0 auto; }
+  h1 { font-size:1.6rem; letter-spacing:-.02em; color:var(--pink); margin-bottom:6px; }
+  .sub { color:var(--muted); font-size:.86rem; margin-bottom:28px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:18px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  label { font-size:.68rem; text-transform:uppercase; letter-spacing:.1em; color:var(--pink); opacity:.85; display:block; margin-bottom:6px; }
+  input[type=text], select { flex:1 1 260px; min-width:0; background:#141417; border:1px solid var(--line); border-radius:7px; color:var(--text); padding:9px 11px; font-family:"SF Mono","Fira Code",ui-monospace,monospace; font-size:.82rem; }
+  input:focus, select:focus { outline:none; border-color:var(--pink); }
+  button { background:var(--pink); color:#fff; border:0; border-radius:7px; padding:10px 16px; font-size:.82rem; font-weight:600; cursor:pointer; }
+  button:hover { filter:brightness(1.12); }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--muted); font-weight:500; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .status { display:inline-flex; align-items:center; gap:8px; font-size:.82rem; color:var(--muted); }
+  .dot { width:8px; height:8px; border-radius:50%; background:#555; flex-shrink:0; }
+  .dot.ok { background:var(--ok); box-shadow:0 0 8px var(--ok); }
+  .dot.bad { background:var(--bad); box-shadow:0 0 8px var(--bad); }
+  .dot.run { background:var(--warn); box-shadow:0 0 8px var(--warn); }
+  h2 { font-size:.7rem; font-weight:700; letter-spacing:.12em; text-transform:uppercase; color:var(--pink); opacity:.8; margin-bottom:12px; }
+  #results { display:flex; flex-direction:column; gap:6px; }
+  .item { border-bottom:1px solid var(--line); padding:9px 2px; font-size:.83rem; }
+  .item:last-child { border-bottom:0; }
+  .item__head { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
+  .item__name { font-weight:600; }
+  .item__meta { color:var(--muted); font-size:.75rem; font-family:"SF Mono","Fira Code",ui-monospace,monospace; margin-left:auto; }
+  .badge { font-size:.68rem; font-weight:700; letter-spacing:.06em; padding:1px 7px; border-radius:4px; font-family:"SF Mono","Fira Code",ui-monospace,monospace; }
+  .badge.pass { background:rgba(0,255,102,.14); color:var(--ok); }
+  .badge.fail { background:rgba(255,59,92,.15); color:var(--bad); }
+  .badge.warn { background:rgba(255,204,0,.14); color:var(--warn); }
+  .badge.info { background:rgba(255,255,255,.1); color:var(--muted); }
+  .item__note { color:var(--muted); font-size:.78rem; margin-top:3px; }
+  .item__note code, .mono { font-family:"SF Mono","Fira Code",ui-monospace,monospace; font-size:.76rem; background:rgba(255,255,255,.06); border-radius:4px; padding:1px 5px; color:var(--text); }
+  pre { margin-top:6px; background:#000; border:1px solid var(--line); border-radius:7px; padding:9px 11px; font-family:"SF Mono","Fira Code",ui-monospace,monospace; font-size:.74rem; color:var(--muted); overflow:auto; max-height:220px; white-space:pre-wrap; word-break:break-word; }
+  .host-grid { display:flex; flex-direction:column; gap:9px; font-size:.8rem; max-width:620px; }
+  .host-grid div { display:flex; justify-content:space-between; gap:12px; border-bottom:1px solid var(--line); padding-bottom:5px; }
+  .host-grid span:first-child { color:var(--muted); }
+  .host-grid span:last-child { font-family:"SF Mono","Fira Code",ui-monospace,monospace; text-align:right; word-break:break-all; }
+  .hint { font-size:.78rem; color:var(--muted); margin-top:10px; }
+  .hint strong { color:var(--warn); }
+  .log { font-family:"SF Mono","Fira Code",ui-monospace,monospace; font-size:.75rem; color:var(--muted); max-height:300px; overflow:auto; white-space:pre-wrap; }
+  .log b { color:var(--text); }
+  .log i { color:var(--ok); font-style:normal; }
+  .log u { color:var(--bad); text-decoration:none; }
+  #playerWrap { display:none; margin-top:16px; }
+  #playerWrap.on { display:block; }
+  #player { width:100%; aspect-ratio:16/9; border:1px solid var(--line); border-radius:10px; background:#000; display:block; }
+  #puzzleWrap { display:none; margin-top:12px; padding:12px; border:1px solid rgba(255,204,0,.35); border-radius:10px; background:rgba(255,204,0,.06); }
+  #puzzleWrap.on { display:block; }
+  #puzzleFrame { width:100%; height:640px; border:1px solid var(--line); border-radius:8px; background:#000; }
+  .puzzleHead { font-size:.76rem; color:#ffcc00; margin-bottom:8px; }
+  .timer { font-family:"SF Mono","Fira Code",ui-monospace,monospace; font-size:.78rem; color:var(--muted); margin-top:8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Plutonium-CGAPI — host probe</h1>
+  <p class="sub">Checks a live deployment of this API from the browser, and can launch a real game through it.</p>
+
+  <div class="panel">
+    <label for="base">Host</label>
+    <div class="row">
+      <input type="text" id="base" value="https://cgapi.cdn.plutoniumnet.work" spellcheck="false">
+      <button id="runRead">Run probes</button>
+      <button id="clear" class="ghost">Clear</button>
+    </div>
+    <div class="hint" style="margin-top:12px">
+      API key <input type="text" id="key" placeholder="auto-filled from /cloud/v1/config" spellcheck="false" style="display:block;width:100%;margin-top:6px">
+      <div style="margin-top:8px">Leave blank to auto-fetch it from <code class="mono">/cloud/v1/config</code> — the deployment publishes its own key.</div>
+    </div>
+    <div class="status" style="margin-top:14px"><span class="dot" id="dot"></span><span id="statusText">Idle</span></div>
+  </div>
+
+  <div class="panel">
+    <h2>Hosting</h2>
+    <div class="host-grid" id="hostInfo"></div>
+    <div class="hint" id="hostNote"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Probes</h2>
+    <div id="results"><div class="item__note">Nothing run yet.</div></div>
+  </div>
+
+  <div class="panel">
+    <h2>Launch a game</h2>
+    <div class="row">
+      <select id="game"><option value="">loading games…</option></select>
+      <input type="text" id="gameKey" placeholder="…or type a game_key" spellcheck="false" style="flex:0 1 190px">
+      <button id="launch">Launch game</button>
+      <button id="quit" class="ghost" disabled>Quit session</button>
+    </div>
+    <div class="hint" style="margin-top:10px"><strong>This plays a real game.</strong> It creates a real upstream account, queues for the title, and streams it over WebRTC into the player below. Sessions cap out on their own, and <em>Quit session</em> ends it immediately — but the queue is shared, so only hit Launch when you mean to play.</div>
+    <pre class="log" id="lifeLog" style="margin-top:12px">idle</pre>
+    <div class="timer" id="timer"></div>
+    <div id="puzzleWrap">
+      <div class="puzzleHead"><strong>Raccoon wants a human.</strong> Drag the slider below to the gap, then release — the answer is relayed to Raccoon on this session's own cookie, so it has to be solved here rather than in your own browser. This panel goes away once it is solved. <a id="puzzleLink" target="_blank" rel="noopener" style="color:#fff;text-decoration:underline">Open in a new tab</a></div>
+      <iframe id="puzzleFrame" title="registration puzzle"></iframe>
+    </div>
+    <div id="playerWrap">
+      <iframe id="player" allow="autoplay; fullscreen; gamepad" allowfullscreen></iframe>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const results = $("results"), hostInfo = $("hostInfo"), hostNote = $("hostNote");
+  const dot = $("dot"), statusText = $("statusText"), lifeLog = $("lifeLog");
+
+  let abortCtl = null;
+  let apiKey = "";
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const now = () => performance.now();
+
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const fmt = (v) => { try { return JSON.stringify(v, null, 2); } catch { return String(v); } };
+
+  function setStatus(text, cls) {
+    statusText.textContent = text;
+    dot.className = "dot" + (cls ? " " + cls : "");
+  }
+
+  function addResult(name, kind, note, body, ms) {
+    const el = document.createElement("div");
+    el.className = "item";
+    const label = { pass: "PASS", fail: "FAIL", warn: "WARN", info: "INFO" }[kind] || "INFO";
+    el.innerHTML =
+      '<div class="item__head"><span class="item__name">' + esc(name) + '</span>' +
+      '<span class="badge ' + kind + '">' + label + '</span>' +
+      (ms != null ? '<span class="item__meta">' + ms.toFixed(0) + " ms</span>" : "") +
+      "</div>" +
+      (note ? '<div class="item__note">' + note + "</div>" : "") +
+      (body !== undefined && body !== null && body !== "" ? "<pre>" + esc(typeof body === "string" ? body : fmt(body)) + "</pre>" : "");
+    results.appendChild(el);
+  }
+
+  function base() {
+    return $("base").value.trim().replace(/\/+$/, "");
+  }
+
+  /** fetch with a timeout the caller controls; never throws on HTTP status. */
+  async function req(path, opts = {}, timeout = 30000) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeout);
+    if (abortCtl) abortCtl.push(ctl);
+    const t0 = now();
+    try {
+      const res = await fetch(base() + path, { ...opts, signal: ctl.signal });
+      const text = await res.text();
+      return { res, text, ms: now() - t0 };
+    } catch (err) {
+      return {
+        res: null,
+        text: "",
+        ms: now() - t0,
+        error: err.name === "TypeError"
+          ? "network/CORS failure: " + err.message + " (unreachable host, TLS failure, or the origin blocked the request)"
+          : err.name + ": " + err.message,
+      };
+    } finally {
+      clearTimeout(timer);
+      if (abortCtl) abortCtl.splice(abortCtl.indexOf(ctl), 1);
+    }
+  }
+
+  const hdr = (r, n) => (r ? r.headers.get(n) : null);
+
+  async function probeHosting() {
+    hostInfo.innerHTML = "";
+    hostNote.textContent = "";
+    const r = await req("/cloud/v1/config", {}, 20000);
+    if (!r.res) {
+      hostInfo.innerHTML = '<div><span>reachable</span><span style="color:var(--bad)">no</span></div>';
+      hostNote.textContent = r.error || "request failed";
+      return false;
+    }
+    const fields = [
+      ["reachable", "yes"],
+      ["page origin", location.origin],
+      ["content-type", hdr(r.res, "content-type") || "—"],
+      ["ttfb", r.ms.toFixed(0) + " ms"],
+    ];
+    hostInfo.innerHTML = fields
+      .map(([k, v]) => "<div><span>" + esc(k) + "</span><span>" + esc(v) + "</span></div>")
+      .join("");
+    hostNote.innerHTML = "Platform headers (<code>server</code>, <code>x-render-origin-server</code>, <code>cf-ray</code>, …) are stripped before page JS sees them — a browser may only read the CORS-safelisted response headers unless the server sends <code>Access-Control-Expose-Headers</code>. To see where this is actually hosted, run from a terminal:<br><code>curl -sSI " + esc(base()) + "/cloud/v1/config</code>";
+    return true;
+  }
+
+  function saveKey(k) {
+    apiKey = k;
+    $("key").value = k;
+  }
+
+  const auth = () => ({ "x-api-key": apiKey });
+
+  async function probes() {
+    results.innerHTML = "";
+    saveKey($("key").value.trim());
+    setStatus("Probing…", "run");
+
+    setStatus("Resolving host…", "run");
+    const up = await probeHosting();
+
+    let r = await req("/", {}, 20000);
+    if (!r.res) addResult("GET /  status page", "fail", esc(r.error), null, r.ms);
+    else addResult(
+      "GET /  status page", r.res.status === 200 ? "pass" : "fail",
+      "HTTP " + r.res.status + " · " + r.text.length + " bytes" + (/Plutonium/i.test(r.text) ? " · identifies as Plutonium" : ""),
+      null, r.ms
+    );
+
+    r = await req("/cloud/v1/config", {}, 20000);
+    if (!r.res) addResult("GET /cloud/v1/config", "fail", esc(r.error), null, r.ms);
+    else {
+      let parsed = null;
+      try { parsed = JSON.parse(r.text); } catch {}
+      const sites = parsed && Array.isArray(parsed.sites) ? parsed.sites : null;
+      if (r.res.status === 200 && sites) {
+        addResult("GET /cloud/v1/config", "pass",
+          "HTTP 200 · " + sites.length + " enabled site" + (sites.length === 1 ? "" : "s") +
+          (sites.length ? " · <code>" + esc(sites.map((s) => s.name).join(", ")) + "</code>" : ""),
+          null, r.ms);
+        if (!apiKey && sites[0] && sites[0].api_key) {
+          saveKey(sites[0].api_key);
+          addResult("API key discovered", "info", "Auto-filled from the public config endpoint (key not shown) — the deployment publishes it, so it is not a secret here.", null, null);
+        }
+      } else {
+        addResult("GET /cloud/v1/config", "fail", "HTTP " + r.res.status + " — expected <code>{sites:[…]}</code>", r.text, r.ms);
+      }
+    }
+
+    if (!apiKey) {
+      addResult("Authenticated probes", "warn",
+        "Skipped: no API key. Paste one above (or the config endpoint must return a site) and run again.", null, null);
+    } else {
+      r = await req("/cloud/v1/getQueue?uuid=00000000-0000-0000-0000-000000000000",
+        { headers: { "x-api-key": "definitely-not-a-valid-key" } }, 20000);
+      addResult("Auth rejects a bad key", r.res && r.res.status === 401 ? "pass" : "fail",
+        r.res ? "HTTP " + r.res.status + " (wanted 401)" : esc(r.error),
+        r.res ? r.text : null, r.ms);
+
+      r = await req("/cloud/v1/getQueue", { headers: auth() }, 20000);
+      addResult("Key accepted · missing uuid", r.res && r.res.status === 400 ? "pass" : "fail",
+        r.res ? "HTTP " + r.res.status + " · " + esc(r.text.slice(0, 120)) : esc(r.error), null, r.ms);
+
+      r = await req("/cloud/v1/getQueue?uuid=00000000-0000-0000-0000-000000000000", { headers: auth() }, 20000);
+      addResult("Unknown session → 404", r.res && r.res.status === 404 ? "pass" : "fail",
+        r.res ? "HTTP " + r.res.status + " (wanted 404) · " + esc(r.text.slice(0, 160)) : esc(r.error), null, r.ms);
+
+      r = await req("/cloud/v1/createSession", {
+        method: "POST",
+        headers: { ...auth(), "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      }, 20000);
+      addResult("createSession rejects no game_key", r.res && r.res.status === 400 ? "pass" : "fail",
+        r.res ? "HTTP " + r.res.status + " · " + esc(r.text.slice(0, 160)) : esc(r.error), null, r.ms);
+    }
+
+    r = await req("/cloud/v1/embed", {}, 20000);
+    addResult("GET /cloud/v1/embed without id", r.res && r.res.status === 400 ? "pass" : "fail",
+      r.res ? "HTTP " + r.res.status + " · " + esc(r.text.slice(0, 120)) : esc(r.error), null, r.ms);
+
+    r = await req("/cloud/v1/embed-data", {}, 20000);
+    addResult("GET /cloud/v1/embed-data without id", r.res && r.res.status === 400 ? "pass" : "fail",
+      r.res ? "HTTP " + r.res.status + " · " + esc(r.text.slice(0, 120)) : esc(r.error), null, r.ms);
+
+    // CORS. The Access-Control-* response headers are not readable from
+    // browser JS (they are stripped unless Access-Control-Expose-Headers lists
+    // them), so test CORS *behaviourally*: a cross-origin request that is not
+    // allowed fails with a TypeError instead of returning a Response.
+    r = await req("/cloud/v1/createSession", {
+      method: "OPTIONS",
+      headers: {
+        "Origin": location.origin,
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type,x-api-key",
+      },
+    }, 20000);
+    addResult("CORS preflight (OPTIONS)", r.res && r.res.status === 200 ? "pass" : "fail",
+      r.res
+        ? "HTTP " + r.res.status + " · the preflight reached the server and was answered; the allow-* values themselves are not visible to page JS."
+        : esc(r.error), null, r.ms);
+
+    r = await req("/cloud/v1/createSession", {
+      method: "POST",
+      headers: { "x-api-key": "probe-invalid-key", "Content-Type": "application/json" },
+      body: "{}",
+    }, 20000);
+    addResult("CORS allows a browser POST with x-api-key", r.res ? "pass" : "fail",
+      r.res
+        ? "Completed cross-origin from <code>" + esc(location.origin) + "</code> → HTTP " + r.res.status +
+          " (401/400 expected; the point is that CORS did not block it)."
+        : esc(r.error) + " — a custom <code>x-api-key</code> header requires a successful preflight, so allow-headers is likely missing it.", null, r.ms);
+
+    r = await req("/cloud/v1/createSession", {
+      method: "POST",
+      headers: { "x-api-key": "probe-invalid-key", "Content-Type": "application/json", "x-probe-not-allowed": "1" },
+      body: "{}",
+    }, 20000);
+    addResult("CORS rejects an unlisted header", r.res ? "warn" : "pass",
+      r.res
+        ? "HTTP " + r.res.status + " was returned for a header not on the allow list — the preflight is not enforcing <code>allow-headers</code> strictly. Not a security hole for this API, but worth knowing."
+        : "Blocked by the browser preflight, as expected — <code>x-probe-not-allowed</code> is not on the allow list.",
+      null, r.ms);
+
+    r = await req("/probe-does-not-exist", {}, 20000);
+    addResult("Unknown route → 404", r.res && r.res.status === 404 ? "pass" : "fail",
+      r.res ? "HTTP " + r.res.status : esc(r.error), null, r.ms);
+
+    await probeSignal();
+
+    const fails = results.querySelectorAll(".badge.fail").length;
+    setStatus(up && fails === 0 ? "All probes passed" : fails + " probe(s) failed", fails === 0 && up ? "ok" : "bad");
+  }
+
+  function probeSignal() {
+    return new Promise((resolve) => {
+      let ws, settled = false;
+      const t0 = now();
+      const finish = (kind, note) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { if (ws) ws.close(); } catch {}
+        addResult("WS /cloud/v1/signal/:uuid", kind, note, null, now() - t0);
+        resolve();
+      };
+      const timer = setTimeout(() => finish("warn", "No close and no open within 8s — the upgrade path did not respond."), 8000);
+      try {
+        ws = new WebSocket(base().replace(/^http/, "ws") + "/cloud/v1/signal/00000000-0000-0000-0000-000000000000");
+      } catch (err) {
+        finish("fail", "Could not open: " + esc(err.message));
+        return;
+      }
+      ws.onopen = () => finish("warn", "Socket opened for a non-existent session — the server should have destroyed it on upgrade.");
+      ws.onclose = () => finish("pass", "Reached the signaling route and was closed: unknown session is rejected on upgrade, as designed.");
+      ws.onerror = () => finish("pass", "Connection refused at the upgrade stage (unknown session) — route is reachable and enforcing state.");
+    });
+  }
+
+  /* ---------- launch a game ---------- */
+
+  const logLine = (html) => {
+    lifeLog.innerHTML += "\n" + html;
+    lifeLog.scrollTop = lifeLog.scrollHeight;
+  };
+
+  // A few well-known keys from cloud.json, used when the full 225-title
+  // catalogue cannot be fetched (the page is usually served on its own).
+  const FALLBACK_GAMES = [
+    ["bs0078", "DRAGON BALL: Sparking! ZERO"],
+    ["bs0096", "Black Myth: Wukong"],
+    ["bs0095", "Red Dead Redemption"],
+    ["bs0093", "Battlefield 6"],
+    ["bs0092", "Mafia: The Old Country"],
+    ["bs0087", "Detroit: Become Human"],
+    ["bs0082", "Far Cry 5"],
+    ["bs0067", "Persona 5 Strikers"],
+  ];
+
+  function fillGames(list, suffix) {
+    $("game").innerHTML = list
+      .map(([k, n]) => '<option value="' + esc(k) + '">' + esc(n) + " — " + esc(k) + (suffix || "") + "</option>")
+      .join("");
+  }
+
+  async function loadGames() {
+    try {
+      const res = await fetch("cloud.json");
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const games = await res.json();
+      if (!Array.isArray(games) || !games.length) throw new Error("empty");
+      fillGames(games.filter((g) => g && g.game_key).map((g) => [g.game_key, g.name || g.game_key]));
+      logLine("catalogue: " + games.length + " games from cloud.json");
+    } catch (err) {
+      fillGames(FALLBACK_GAMES);
+      logLine("cloud.json not reachable here (" + esc(err.message) + ") — showing 8 built-in titles; type any other game_key in the box.");
+    }
+  }
+
+  let live = null;   // { uuid, pingTimer, tickTimer, startedAt, maxSeconds }
+
+  function stopTimers() {
+    if (!live) return;
+    clearInterval(live.pingTimer);
+    clearInterval(live.tickTimer);
+  }
+
+  function closePlayer() {
+    stopTimers();
+    $("player").src = "about:blank";
+    $("playerWrap").classList.remove("on");
+    $("timer").textContent = "";
+    live = null;
+    $("quit").disabled = true;
+    $("launch").disabled = false;
+  }
+
+  async function quitSession(silent) {
+    const uuid = live?.uuid;
+    closePlayer();
+    if (!uuid) return;
+    logLine("POST /cloud/v1/quitSession");
+    const qs = await req("/cloud/v1/quitSession", {
+      method: "POST",
+      headers: { ...auth(), "Content-Type": "application/json" },
+      body: JSON.stringify({ uuid }),
+    }, 20000);
+    logLine("  ← HTTP " + (qs.res ? qs.res.status : "—") + " " + esc(qs.text.slice(0, 200)));
+    if (!silent) logLine("session closed.");
+  }
+
+  async function ensureKey() {
+    if (!apiKey && $("key").value.trim()) saveKey($("key").value.trim());
+    if (apiKey) return true;
+    const c = await req("/cloud/v1/config", {}, 20000);
+    try {
+      const p = JSON.parse(c.text);
+      if (p.sites?.[0]?.api_key) saveKey(p.sites[0].api_key);
+    } catch {}
+    return !!apiKey;
+  }
+
+  async function launch() {
+    if (live) { logLine("<u>a session is already running — quit it first.</u>"); return; }
+    if (!(await ensureKey())) { logLine("<u>no API key — cannot launch.</u>"); return; }
+
+    abortCtl = [];
+    const manual = $("gameKey").value.trim();
+    const game_key = manual || $("game").value;
+    const label = manual || $("game").selectedOptions[0]?.textContent || game_key;
+    $("launch").disabled = true;
+    $("quit").disabled = true;
+    lifeLog.textContent = "";
+    logLine("launching <b>" + esc(label) + "</b>");
+
+    let uuid = null;
+    let ready = false;
+    try {
+      // 1 — createSession. Responds as NDJSON; the account work takes a while,
+      // so read the stream incrementally rather than waiting for res.text().
+      logLine("POST /cloud/v1/createSession");
+      const ctl = new AbortController();
+      abortCtl.push(ctl);
+      const t0 = Date.now();
+      const res = await fetch(base() + "/cloud/v1/createSession", {
+        method: "POST",
+        headers: { ...auth(), "Content-Type": "application/json" },
+        body: JSON.stringify({ game_key }),
+        signal: ctl.signal,
+      });
+      if (!res.ok || !res.body) {
+        const t = await res.text();
+        logLine("  <u>HTTP " + res.status + " · " + esc(t.slice(0, 300)) + "</u>");
+        throw new Error("createSession failed: HTTP " + res.status);
+      }
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop();
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let evt;
+          try { evt = JSON.parse(line); } catch { continue; }
+          if (evt.uuid) uuid = evt.uuid;
+          logLine("  " + (Date.now() - t0) / 1000 + "s · <i>" + esc(evt.status || "?") + "</i>" +
+            (evt.queue_pos != null ? " · queue position " + evt.queue_pos : "") +
+            (evt.uuid ? " · <b>" + esc(evt.uuid.slice(0, 8)) + "</b>" : "") +
+            (evt.error ? " <u>" + esc(evt.error) + "</u>" : ""));
+          if (evt.status === "finished_queue") ready = true;
+          if (evt.status === "puzzle_required") {
+            // Raccoon's registration gate. The server holds the session cookie,
+            // so the challenge is solved in this panel and relayed back.
+            $("puzzleWrap").classList.add("on");
+            const puzzleUrl =
+              base() + "/puzzle?session=" + encodeURIComponent(evt.uuid || uuid || "");
+            $("puzzleFrame").src = puzzleUrl;
+            $("puzzleLink").href = puzzleUrl;
+            logLine("  ↑ <b>solve the puzzle</b> in the panel below — it gates this account");
+          }
+          if (["account_ready", "queue", "finished_queue"].includes(evt.status))
+            $("puzzleWrap").classList.remove("on");
+          if (evt.status === "error") throw new Error(evt.error || "createSession error");
+        }
+      }
+      abortCtl.splice(abortCtl.indexOf(ctl), 1);
+      if (!uuid) throw new Error("createSession returned no uuid");
+      if (ready) logLine("  already out of the queue.");
+
+      // 2 — getQueue. Only needed while queued; the server rate-limits polls to
+      // one per 3s, so space them out and surface position changes.
+      if (!ready) {
+        logLine("polling getQueue…");
+        let lastPos = null;
+        for (let i = 0; i < 100; i++) {
+          const q = await req("/cloud/v1/getQueue?uuid=" + uuid, { headers: auth() }, 20000);
+          if (!q.res) { logLine("  <u>" + esc(q.error) + "</u>"); break; }
+          let body = null;
+          try { body = JSON.parse(q.text); } catch {}
+          if (q.res.status === 429) { await sleep(3200); continue; }
+          if (q.res.status === 404) { logLine("  <u>session expired while queued</u>"); throw new Error("session expired"); }
+          if (q.res.status >= 400) { logLine("  <u>HTTP " + q.res.status + " · " + esc(q.text.slice(0, 200)) + "</u>"); throw new Error("getQueue HTTP " + q.res.status); }
+          if (body?.status === "finished_queue") { logLine("  <i>finished_queue</i> — ready to start"); ready = true; break; }
+          if (body?.queue_pos != null && body.queue_pos !== lastPos) {
+            lastPos = body.queue_pos;
+            logLine("  queue position " + body.queue_pos);
+          }
+          await sleep(3200);
+        }
+        if (!ready) throw new Error("still queued — gave up waiting (the session will be reaped)");
+      }
+
+      // 3 — startGame must land within 30s of finishing the queue.
+      logLine("POST /cloud/v1/startGame");
+      const sg = await req("/cloud/v1/startGame", {
+        method: "POST",
+        headers: { ...auth(), "Content-Type": "application/json" },
+        body: JSON.stringify({ uuid }),
+      }, 30000);
+      logLine("  ← HTTP " + (sg.res ? sg.res.status : "—") + " " + esc(sg.text.slice(0, 400)));
+      if (!sg.res || !sg.res.ok) throw new Error("startGame failed");
+      const started = JSON.parse(sg.text);
+      const ice = (started.ice_servers || []).length;
+      logLine("  <i>session active</i> · " + ice + " ICE server(s) · cap " + Math.round((started.max_seconds || 0) / 60) + " min");
+
+      // 4 — the player. /cloud/v1/embed runs the whole WebRTC handshake itself.
+      live = {
+        uuid,
+        startedAt: Date.now(),
+        maxSeconds: started.max_seconds || 1140,
+        pingTimer: null,
+        tickTimer: null,
+      };
+      $("player").src = base() + "/cloud/v1/embed?id=" + encodeURIComponent(uuid);
+      $("playerWrap").classList.add("on");
+      $("quit").disabled = false;
+      logLine("player → " + esc(base()) + "/cloud/v1/embed?id=" + esc(uuid.slice(0, 8)) + "…");
+
+      // Keepalive: the server reaps an active session after 30s without a ping.
+      live.pingTimer = setInterval(async () => {
+        if (!live) return;
+        const p = await req("/cloud/v1/pingSession", {
+          method: "POST",
+          headers: { ...auth(), "Content-Type": "application/json" },
+          body: JSON.stringify({ uuid: live.uuid }),
+        }, 15000);
+        if (p.res && p.res.status === 200) {
+          try {
+            const d = JSON.parse(p.text);
+            $("timer").textContent = "playing " + d.session_time_used_seconds + "s of " + d.session_time_limit_seconds + "s";
+          } catch {}
+        } else if (p.res && p.res.status >= 400) {
+          logLine("  <u>ping → HTTP " + p.res.status + " · " + esc(p.text.slice(0, 160)) + "</u>");
+          if (p.res.status === 404 || p.res.status === 400) {
+            logLine("session ended.");
+            closePlayer();
+          }
+        }
+      }, 10000);
+
+      live.tickTimer = setInterval(() => {
+        if (!live) return;
+        const left = Math.max(0, live.maxSeconds - Math.round((Date.now() - live.startedAt) / 1000));
+        if (!/playing/.test($("timer").textContent)) {
+          $("timer").textContent = "session budget " + left + "s remaining";
+        }
+      }, 1000);
+    } catch (err) {
+      logLine("<u>" + esc(err.name) + ": " + esc(err.message) + "</u>");
+      logLine("cleaning up…");
+      closePlayer();
+      if (uuid) {
+        try {
+          const qs = await fetch(base() + "/cloud/v1/quitSession", {
+            method: "POST",
+            headers: { ...auth(), "Content-Type": "application/json" },
+            body: JSON.stringify({ uuid }),
+          });
+          logLine("  quitSession ← HTTP " + qs.status);
+        } catch (e) {
+          logLine("  <u>cleanup failed: " + esc(e.message) + "</u>");
+        }
+      }
+      $("launch").disabled = false;
+    } finally {
+      abortCtl = null;
+    }
+  }
+
+  $("runRead").addEventListener("click", probes);
+  $("clear").addEventListener("click", () => { results.innerHTML = '<div class="item__note">Nothing run yet.</div>'; setStatus("Idle"); hostInfo.innerHTML = ""; hostNote.textContent = ""; });
+  $("launch").addEventListener("click", launch);
+  $("quit").addEventListener("click", () => quitSession(false));
+  // No unload handler on purpose: closing the page stops the keepalive, and the
+  // server reaps an active session ~30s later. A beacon here would need a
+  // preflighted JSON POST, which sendBeacon cannot do.
+  loadGames();
+})();
+</script>
+</body>
+</html>
