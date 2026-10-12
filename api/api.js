@@ -417,9 +417,10 @@ async function requestRegistrationEmail({
   return data;
 }
 
-// Every pooled account now needs a human to drag its registration puzzle, so a
-// pool that nobody is watching only ever accumulates unsolvable prompts.
-const POOL_TARGET = Math.max(0, Number(process.env.POOL_TARGET ?? 5) || 0);
+// Every account now needs a human to drag its registration puzzle, so a pool
+// that nobody is watching only accumulates unsolvable prompts and holds account
+// slots for them. Off by default; set POOL_TARGET to pre-create deliberately.
+const POOL_TARGET = Math.max(0, Number(process.env.POOL_TARGET ?? 0) || 0);
 const pool = [];
 let poolFilling = false;
 

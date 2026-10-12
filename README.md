@@ -96,7 +96,7 @@ The lighter alternative needs no infrastructure: have the *user* read the code. 
 | `PORT` | 3001 | listen port |
 | `MALQ_URL` | `http://127.0.0.1:4400` | malq base URL |
 | `MALQ_PROVIDER` | *(random)* | pin one malq provider, e.g. `lwUpdateDomain\edumailfree.com` |
-| `POOL_TARGET` | 5 | accounts to pre-create; set `0` when every account needs a human solve |
+| `POOL_TARGET` | 0 | accounts to pre-create; every solve needs a human, so pre-creating only parks prompts |
 | `DISPOSABLE_LIST_URL` | upstream blocklist | source for disposable-domain pre-screening |
 | `DISPOSABLE_LIST_FILE` | temp dir | cached copy of that list |
 
