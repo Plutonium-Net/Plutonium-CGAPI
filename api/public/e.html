@@ -446,7 +446,7 @@
             const host   = params.get('host');
             if (!id) return;
             try {
-                const res  = await fetch(`/api/cloud/embed-data?id=${encodeURIComponent(id)}`);
+                const res  = await fetch(`/cloud/v1/embed-data?id=${encodeURIComponent(id)}`);
                 const data = await res.json();
                 if (host && data.signaling_ws) {
                     data.signaling_ws = data.signaling_ws.replace(/wss?:\/\/[^/]+/, `wss://${host}`);

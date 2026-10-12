@@ -229,11 +229,33 @@ async function createAccountRaw() {
     os: "web",
   };
 
-  await raccoonFetch("/users/sendEmail", {
+  // Raccoon answers HTTP 200 even when it refuses the request — the real
+  // outcome is the `status` in the JSON body. Checking only the HTTP status
+  // (or nothing at all) makes a refused send indistinguishable from a slow
+  // mailbox: the code then waits out the whole 90s verification window and
+  // reports "Timeout getting verification code", which points at the mail
+  // provider instead of at the actual rejection.
+  const sendRes = await raccoonFetch("/users/sendEmail", {
     method: "POST",
     headers: h,
     body: new URLSearchParams({ email, type: "register", ...base }),
   });
+  const sendBody = await sendRes.text();
+  let sendData = null;
+  try {
+    sendData = JSON.parse(sendBody);
+  } catch {}
+  if (
+    !sendRes.ok ||
+    (sendData && typeof sendData.status === "number" && sendData.status !== 200)
+  ) {
+    throw new Error(
+      `sendEmail rejected — HTTP ${sendRes.status}` +
+        (sendData?.msg
+          ? ` · ${sendData.msg}`
+          : ` · ${sendBody.slice(0, 160)}`),
+    );
+  }
 
   const code = await getVerificationCode(mailJwt);
 
@@ -777,7 +799,12 @@ app.use((req, res, next) => {
     });
   }
 
+  // Only a request whose response has not started can be safely refused.
+  // Writing a 408 after a handler has begun streaming (createSession's NDJSON)
+  // throws ERR_HTTP_HEADERS_SENT and cuts the stream off mid-flight, which
+  // truncates the response before the session uuid ever reaches the client.
   req.setTimeout(30_000, () => {
+    if (res.headersSent) return;
     res.status(408).json({ error: "Request timeout." });
   });
 
@@ -854,6 +881,11 @@ app.post("/cloud/v1/createSession", auth, async (req, res) => {
   res.setHeader("Content-Type", "application/x-ndjson");
   res.setHeader("Transfer-Encoding", "chunked");
   res.setHeader("Cache-Control", "no-cache");
+  // Registering the account and joining the upstream queue legitimately takes
+  // far longer than the 30s socket timeout applied to ordinary requests, and
+  // this response is a long-lived stream that ends with the handler. Opt out
+  // here; a session stuck in `creating` is still reaped after 5 minutes.
+  req.setTimeout(0);
   res.flushHeaders();
 
   const push = (obj) => res.write(JSON.stringify(obj) + "\n");
