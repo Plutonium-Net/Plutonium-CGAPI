@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Plutonium-CGAPI</title>
+  <style>
+    :root { --pink: #e8175d; }
+    body { margin: 0; padding: 56px 24px; background: #000; color: #e5e5e5;
+           font: 14px/1.7 "SF Mono", "Fira Code", ui-monospace, monospace; }
+    main { max-width: 620px; margin: 0 auto; }
+    h1 { font-size: 1.3rem; color: var(--pink); margin: 0 0 8px; }
+    .status { margin: 0 0 36px; color: #9ca3af; display: flex; align-items: center; gap: 8px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #22c55e;
+           box-shadow: 0 0 8px #22c55e; flex-shrink: 0; }
+    h2 { font-size: .72rem; letter-spacing: .14em; text-transform: uppercase;
+         color: #6b7280; margin: 0 0 12px; font-weight: 600; }
+    ul { list-style: none; margin: 0; padding: 0; }
+    li { display: flex; gap: 14px; padding: 7px 0; border-bottom: 1px solid #171717; }
+    .method { color: var(--pink); width: 48px; flex-shrink: 0; }
+    .path { color: #e5e5e5; }
+    .desc { color: #6b7280; margin-left: auto; text-align: right; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Plutonium-CGAPI</h1>
+  <p class="status"><span class="dot"></span>API is running</p>
+
+  <h2>Routes</h2>
+  <ul>
+    <li><span class="method">GET</span><span class="path">/</span><span class="desc">this page</span></li>
+    <li><span class="method">GET</span><span class="path">/cloud/v1/config</span><span class="desc">enabled sites and keys</span></li>
+    <li><span class="method">POST</span><span class="path">/cloud/v1/createSession</span><span class="desc">start a session</span></li>
+    <li><span class="method">GET</span><span class="path">/cloud/v1/getQueue</span><span class="desc">queue position</span></li>
+    <li><span class="method">POST</span><span class="path">/cloud/v1/startGame</span><span class="desc">activate a session</span></li>
+    <li><span class="method">POST</span><span class="path">/cloud/v1/pingSession</span><span class="desc">keep a session alive</span></li>
+    <li><span class="method">POST</span><span class="path">/cloud/v1/quitSession</span><span class="desc">end a session</span></li>
+    <li><span class="method">GET</span><span class="path">/cloud/v1/embed</span><span class="desc">player embed page</span></li>
+    <li><span class="method">GET</span><span class="path">/cloud/v1/embed-data</span><span class="desc">ICE servers and signaling</span></li>
+    <li><span class="method">WS</span><span class="path">/cloud/v1/signal/:uuid</span><span class="desc">WebRTC signaling</span></li>
+  </ul>
+</main>
+</body>
+</html>
