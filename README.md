@@ -70,8 +70,10 @@ RaccoonGame gates account creation behind a slide-the-piece puzzle, and the solv
 2. Whoever is driving the session solves it at `GET /puzzle?session=<uuid>`, which serves `api/public/puzzle.html`: drag the piece onto the gap and release.
 3. `POST /cloud/v1/puzzles/<id>` with `{ offset }` forwards the answer on that session's own cookie jar, then answers with Raccoon's verdict — `200` when accepted, `422` with Raccoon's message when not.
 4. A rejected solve raises a *fresh* challenge for the same email (up to three tries), so a mis-drag costs a retry instead of the session. Sessions also get the puzzle window added to their creation budget so a human's drag is not reaped.
+5. If the address itself is the problem — Raccoon refuses it as disposable, its mailbox never receives the code, the mail arrives without a code in it, or the provider cannot be read at all (a scraper throwing on every poll) — the flow asks malq for **another address** and raises a puzzle for that one, up to `MAIL_ATTEMPTS` times (default 4). Those events carry `attempt` and `attempts`, `GET /cloud/v1/puzzles` reports them per puzzle, and the page labels each puzzle with the address it authorises. Each address is given `MAIL_WAIT_SECONDS` (default 120) to produce the code, which is the cost of a failed attempt.
+6. A register call that demands its own human verification is retried the way Raccoon asks — another code, another puzzle, same address — up to `REGISTER_TRIES` times.
 
-`GET /cloud/v1/puzzles` lists what is waiting. One solve authorises exactly one address, so puzzles are raised per account and never pooled.
+`GET /cloud/v1/puzzles` lists what is waiting. One solve authorises exactly one address, so puzzles are raised per account and never pooled — and a retry needs its own solve, because the new address cannot reuse the old one's.
 
 ## receiving the code from a real mailbox
 
@@ -80,7 +82,9 @@ Two independent filters decide whether a registration address works at all, and 
 - **Raccoon refuses disposable domains** ("Temporary email addresses are not supported"), so a blocked address throws away a human's solve. `api.js` pre-screens against the public disposable-domain blocklist (`DISPOSABLE_LIST_URL`, cached at `DISPOSABLE_LIST_FILE`).
 - **The domain has to accept mail.** Addresses must be plausible and carry an MX record; malq's pools do hand out domains with no MX at all.
 
-Even past both filters delivery stays a lottery — malq's provider pools rotate, and the same provider delivered in 15 seconds on one domain and never on the next. A domain you control removes the lottery:
+Even past both filters delivery stays a lottery — malq's provider pools rotate, and the same provider delivered in 15 seconds on one domain and never on the next. The flow therefore treats a refused or silent address as "try another one" rather than the end of the launch, which costs one more human solve per attempt.
+
+A domain you control removes the lottery entirely:
 
 1. Expose malq on a public URL (Cloudflare Tunnel, or run it on your own host).
 2. Put the domain on Cloudflare, enable Email Routing, and add an Email Worker that POSTs each message to malq's inbound endpoint.
@@ -88,6 +92,10 @@ Even past both filters delivery stays a lottery — malq's provider pools rotate
 4. Pin the provider with `MALQ_PROVIDER`.
 
 The lighter alternative needs no infrastructure: have the *user* read the code. Send the registration to an address they already hold (a Gmail alias is not disposable, so Raccoon accepts it) and relay the six digits into the session the way the puzzle offset is relayed — a `code_required` event and a `POST /cloud/v1/code` endpoint.
+
+## the register call's own human check
+
+Raccoon can refuse `/users/emailRegister` *after* the code has arrived and parsed — `Human verification is required. Please request a new email code.` The solve that authorised `sendEmail` does not cover registration, and its own message says what to do about it, so the flow requests another code (which raises a fresh puzzle, hence another solve), skips the now-stale code still sitting in the inbox, and tries registration again — up to `REGISTER_TRIES` (default 3). The address has already proven it can receive mail, so it is kept rather than thrown away.
 
 ## environment
 
@@ -97,6 +105,9 @@ The lighter alternative needs no infrastructure: have the *user* read the code. 
 | `MALQ_URL` | `http://127.0.0.1:4400` | malq base URL |
 | `MALQ_PROVIDER` | *(random)* | pin one malq provider, e.g. `lwUpdateDomain\edumailfree.com` |
 | `POOL_TARGET` | 0 | accounts to pre-create; every solve needs a human, so pre-creating only parks prompts |
+| `MAIL_ATTEMPTS` | 4 | addresses to try per launch, each needing its own puzzle solve |
+| `MAIL_WAIT_SECONDS` | 120 | how long each address's mailbox gets to produce the code |
+| `REGISTER_TRIES` | 3 | register attempts per address when Raccoon demands a fresh code |
 | `DISPOSABLE_LIST_URL` | upstream blocklist | source for disposable-domain pre-screening |
 | `DISPOSABLE_LIST_FILE` | temp dir | cached copy of that list |
 

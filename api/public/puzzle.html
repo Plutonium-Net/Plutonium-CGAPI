@@ -42,7 +42,7 @@
 <body>
 <div class="wrap">
   <h1>Registration puzzle</h1>
-  <p class="sub">Raccoon gates new accounts behind a slider. Your server holds the session, so the puzzle is solved here and relayed back — one solve authorises exactly one address.</p>
+  <p class="sub">Raccoon gates new accounts behind a slider. Your server holds the session, so the puzzle is solved here and relayed back — one solve authorises exactly one address. If Raccoon refuses that address, or its mailbox never receives the code, the server asks for another address and a new puzzle appears here.</p>
 
   <div class="panel">
     <label for="base">API host</label>
@@ -147,6 +147,7 @@
     $("bg").onload = () => { $("piece").style.opacity = "1"; render(); };
     $("puzzleMeta").innerHTML =
       "email <b>" + esc(p.email) + "</b>" + (p.session ? '<span class="pill session">session ' + esc(String(p.session).slice(0, 8)) + "</span>" : '<span class="pill">pool</span>') +
+      (p.attempts > 1 ? '<span class="pill">address ' + p.attempt + " of " + p.attempts + "</span>" : "") +
       "<br>challenge " + esc(c.challenge_id) + " · " + c.width + "×" + c.height + " · piece " + c.piece_size +
       " · expires in " + p.expires_in_seconds + "s";
     $("puzzlePanel").style.display = "block";
@@ -180,6 +181,7 @@
       $("pending").innerHTML = list.length
         ? list.map((p) => '<div class="meta">' + esc(p.email) + " · " + esc(p.id.slice(0, 8)) +
             (p.session ? ' · <span class="pill session">session ' + esc(String(p.session).slice(0, 8)) + "</span>" : ' · <span class="pill">pool</span>') +
+            (p.attempts > 1 ? ' · <span class="pill">address ' + p.attempt + "/" + p.attempts + "</span>" : "") +
             " · " + p.age_seconds + "s old</div>").join("")
         : '<span class="empty">Nothing waiting.</span>';
 
@@ -219,7 +221,7 @@
       } else if (r.status === 422) {
         // The challenge is spent, so the poll below pulls a fresh one.
         clearPuzzle();
-        setStatus("Wrong position — Raccoon rejected that offset. Loading a new puzzle…", "bad");
+        setStatus("Wrong position — Raccoon rejected that offset for this address. Loading a new puzzle…", "bad");
       } else {
         setStatus("Failed (HTTP " + r.status + "): " + String(msg).slice(0, 160), "bad");
       }

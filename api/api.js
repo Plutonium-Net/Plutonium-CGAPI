@@ -205,10 +205,20 @@ function extractVerificationCode(text) {
   return bare ? bare[1] : null;
 }
 
+// How long to wait for a code before calling an address's mailbox unusable.
+// This is the wall-clock cost of a failed attempt, since every address gets its
+// own window, so it is bounded rather than left to the poll loop's maximum.
+const MAIL_WAIT_SECONDS = Math.max(
+  5,
+  Number(process.env.MAIL_WAIT_SECONDS ?? 120) || 120,
+);
+
 // Polls the malq inbox for Raccoon's 6-digit code. A provider that fails on
 // every poll would otherwise burn the whole window silently, so the last error
 // is carried into the timeout message.
-async function getVerificationCode(mailToken, maxAttempts = 40) {
+async function getVerificationCode(mailToken, exclude = null) {
+  const startedAt = Date.now();
+  const maxAttempts = Math.max(1, Math.round(MAIL_WAIT_SECONDS / 3));
   let lastError = null;
   let announced = false;
   for (let i = 0; i < maxAttempts; i++) {
@@ -231,9 +241,19 @@ async function getVerificationCode(mailToken, maxAttempts = 40) {
           .replace(/<[^>]*>/g, " ")
           .replace(/&nbsp;/g, " ");
         const code = extractVerificationCode(text);
-        if (code) {
+        if (code && !exclude?.has(code)) {
           logSys(chalk.gray(`mail: code found in "${subject.slice(0, 48)}"`));
           return code;
+        }
+        // Re-requesting a code leaves the previous one in the inbox; using it
+        // again would only get the same refusal back.
+        if (code) {
+          logSys(
+            chalk.gray(
+              `mail: ignoring already-used code in "${subject.slice(0, 48)}"`,
+            ),
+          );
+          continue;
         }
         // A message that arrives without a parseable code is a different bug
         // from one that never arrives, so show what it actually contained.
@@ -249,8 +269,14 @@ async function getVerificationCode(mailToken, maxAttempts = 40) {
     }
   }
   throw new Error(
-    "Timeout getting verification code" +
-      (lastError ? ` (${lastError.message})` : ""),
+    `Timeout getting verification code after ${Math.round(
+      (Date.now() - startedAt) / 1000,
+    )}s — ` +
+      (lastError
+        ? `mailbox errors, last: ${lastError.message}`
+        : announced
+          ? "mail arrived but no 6-digit code in it"
+          : "mailbox stayed empty, so the upstream never sent it"),
   );
 }
 
@@ -263,8 +289,41 @@ async function getVerificationCode(mailToken, maxAttempts = 40) {
 const PUZZLE_TIMEOUT_MS = 10 * 60_000;
 const pendingPuzzles = new Map(); // id -> { id, session, email, challenge, resolve }
 
+// Raccoon only decides an address is unusable *after* its puzzle is solved, and
+// mail to a disposable domain is a lottery (a provider's domain pool can rotate
+// a previously-good domain away), so a refusal or a silent mailbox means "ask
+// malq for a different address", not "give up on the launch". Each attempt
+// needs its own solve from a human, because one solve authorises one address.
+const MAIL_ATTEMPTS = Math.max(1, Number(process.env.MAIL_ATTEMPTS) || 4);
+
 function isPuzzleRefusal(text) {
   return /puzzle verification/i.test(text || "");
+}
+
+// Raccoon refuses /users/emailRegister even after sendEmail was verified, saying
+// a human verification is required and to request a new email code. Its own
+// advice is the fix: request another code, which raises a fresh puzzle and a
+// fresh verification for the register call. Each pass costs one solve.
+const REGISTER_TRIES = Math.max(1, Number(process.env.REGISTER_TRIES) || 3);
+
+function isHumanVerificationRefusal(text = "") {
+  return /human verification is required/i.test(text);
+}
+
+// Only failures a different address can actually fix are retried: Raccoon
+// rejecting this address, or this address's mailbox being unusable — it never
+// received the code, it received something without a code in it, or its
+// provider could not be read at all ("mailbox errors", e.g. a scraper throwing
+// on every poll, which is a dead provider rather than a transient blip).
+// Everything else (a wrong code, an abandoned puzzle, malq being down) is
+// reported as-is rather than burning another solve on it.
+function isRetryableMailFailure(message = "") {
+  return (
+    /temporary email addresses are not supported/i.test(message) ||
+    /mailbox stayed empty/i.test(message) ||
+    /mailbox errors/i.test(message) ||
+    /mail arrived but no 6-digit code/i.test(message)
+  );
 }
 
 // Fetches a challenge on this jar's session and parks it for a human, invoking
@@ -277,6 +336,8 @@ async function completePuzzle({
   headers,
   onPuzzle,
   sessionUuid,
+  attempt,
+  attempts,
 }) {
   const qs = new URLSearchParams({
     email,
@@ -304,6 +365,8 @@ async function completePuzzle({
     id,
     session: sessionUuid || null,
     email,
+    attempt: attempt || 1,
+    attempts: attempts || 1,
     challenge,
     created_at: Date.now(),
     verdict,
@@ -311,7 +374,10 @@ async function completePuzzle({
   };
   pendingPuzzles.set(id, entry);
   logSys(
-    chalk.yellow(`puzzle required → ${chalk.white(id.slice(0, 8))} · ${email}`),
+    chalk.yellow(
+      `puzzle required → ${chalk.white(id.slice(0, 8))} · ${email}` +
+        (entry.attempts > 1 ? ` · address ${entry.attempt}/${entry.attempts}` : ""),
+    ),
   );
 
   let offset;
@@ -347,6 +413,13 @@ async function completePuzzle({
       }),
     });
     const vBody = await vRes.json().catch(() => null);
+    // What the verify hands back matters: if register later says a human
+    // verification is required, this body is where any proof of it would live.
+    logSys(
+      chalk.gray(
+        `puzzle verify ← ${vRes.status} ${JSON.stringify(vBody).slice(0, 200)}`,
+      ),
+    );
     if (vBody?.status !== 200) {
       const message = vBody?.msg || `HTTP ${vRes.status}`;
       entry.settle({ ok: false, message });
@@ -372,6 +445,8 @@ async function requestRegistrationEmail({
   headers,
   onPuzzle,
   sessionUuid,
+  puzzleAttempt,
+  puzzleAttempts,
 }) {
   const attempt = async () => {
     const res = await raccoonFetch("/users/sendEmail", {
@@ -396,7 +471,16 @@ async function requestRegistrationEmail({
   for (let tries = 0; tries < MAX_PUZZLE_TRIES; tries++) {
     if (!isPuzzleRefusal(data?.msg) && !isPuzzleRefusal(raw)) break;
     try {
-      await completePuzzle({ jar, email, sn, headers, onPuzzle, sessionUuid });
+      await completePuzzle({
+        jar,
+        email,
+        sn,
+        headers,
+        onPuzzle,
+        sessionUuid,
+        attempt: puzzleAttempt,
+        attempts: puzzleAttempts,
+      });
     } catch (e) {
       logSys(chalk.red(`puzzle: attempt ${tries + 1} failed — ${e.message}`));
       if (tries === MAX_PUZZLE_TRIES - 1) throw e;
@@ -572,10 +656,11 @@ async function mailSessionWithDeliverableDomain(providerQs, tries = 6) {
   return last;
 }
 
+// An address can fail in two ways that a *different* address fixes: Raccoon
+// refuses it outright, or its provider never receives the code. Both are worth
+// one more solve, so re-run the whole flow — fresh mailbox, cookie jar, password
+// and sn — up to MAIL_ATTEMPTS times before giving up on the launch.
 async function createAccountRaw(opts = {}) {
-  // The jar carries the Raccoon session across the mailbox, puzzle and register
-  // calls; a puzzle solved here only counts for this jar and this email.
-  const jar = opts.jar || newRaccoonJar();
   // malq picks the provider and creates the inbox itself, unlike mail.tm which
   // needed a domain lookup, an account and a token before mail could arrive.
   // malq has one provider per domain and Raccoon refuses some of those domains
@@ -583,11 +668,50 @@ async function createAccountRaw(opts = {}) {
   const providerQs = process.env.MALQ_PROVIDER
     ? `?provider=${encodeURIComponent(process.env.MALQ_PROVIDER)}`
     : "";
+
+  let lastError = null;
+  for (let attempt = 1; attempt <= MAIL_ATTEMPTS; attempt++) {
+    try {
+      return await createAccountAttempt({
+        ...opts,
+        providerQs,
+        attempt,
+        attempts: MAIL_ATTEMPTS,
+      });
+    } catch (e) {
+      lastError = e;
+      if (!isRetryableMailFailure(e.message) || attempt >= MAIL_ATTEMPTS) throw e;
+      logSys(
+        chalk.yellow(
+          `mail: address ${attempt}/${MAIL_ATTEMPTS} unusable (${e.message}) — requesting another address`,
+        ),
+      );
+    }
+  }
+  throw lastError || new Error("account creation failed");
+}
+
+async function createAccountAttempt({
+  jar: inheritedJar,
+  providerQs,
+  attempt,
+  attempts,
+  ...opts
+}) {
+  // The jar carries the Raccoon session across the mailbox, puzzle and register
+  // calls; a puzzle solved here only counts for this jar and this email — and
+  // only for the address that asked for it, so a retry always starts a new jar.
+  const jar = attempt === 1 && inheritedJar ? inheritedJar : newRaccoonJar();
   const box = await mailSessionWithDeliverableDomain(providerQs);
   const email = box?.address;
   const mailToken = box?.token;
   if (!email || !mailToken) throw new Error("malq returned no session");
-  logSys(chalk.gray(`mail: ${email} · ${box.provider || "unknown provider"}`));
+  logSys(
+    chalk.gray(
+      `mail: ${email} · ${box.provider || "unknown provider"}` +
+        (attempts > 1 ? ` · attempt ${attempt}/${attempts}` : ""),
+    ),
+  );
 
   const raccoonPassword = generatePassword();
   const sn = generateSN();
@@ -606,41 +730,57 @@ async function createAccountRaw(opts = {}) {
     os: "web",
   };
 
-  await requestRegistrationEmail({
-    jar,
-    email,
-    sn,
-    base,
-    headers: h,
-    onPuzzle: opts.onPuzzle,
-    sessionUuid: opts.sessionUuid,
-  });
-
-  const code = await getVerificationCode(mailToken);
-
   // The register reply is the only place a rejected code shows up; ignoring it
   // made every failure surface one step later as a bare "Login failed".
-  const regRes = await raccoonFetch("/users/emailRegister", {
-    method: "POST",
-    jar,
-    headers: h,
-    body: new URLSearchParams({
+  // A register call that demands its own human verification is retried the way
+  // Raccoon asks — another email code, hence another puzzle — rather than
+  // throwing away an address whose mail demonstrably arrived.
+  const usedCodes = new Set();
+  let lastCode = null;
+  for (let regTry = 1; ; regTry++) {
+    await requestRegistrationEmail({
+      jar,
       email,
-      code,
-      password: raccoonPassword,
-      phone: "1",
-      country: "Brazil",
-      ...base,
-    }),
-  });
-  const regBody = await regRes.json().catch(() => null);
-  if (
-    regRes.status !== 200 ||
-    (regBody && typeof regBody.status === "number" && regBody.status !== 200)
-  ) {
-    throw new Error(
-      `registration rejected — HTTP ${regRes.status}` +
-        (regBody?.msg ? ` · ${regBody.msg}` : ` · code ${code}`),
+      sn,
+      base,
+      headers: h,
+      onPuzzle: opts.onPuzzle,
+      sessionUuid: opts.sessionUuid,
+      puzzleAttempt: attempt,
+      puzzleAttempts: attempts,
+    });
+
+    lastCode = await getVerificationCode(mailToken, usedCodes);
+    usedCodes.add(lastCode);
+
+    const regRes = await raccoonFetch("/users/emailRegister", {
+      method: "POST",
+      jar,
+      headers: h,
+      body: new URLSearchParams({
+        email,
+        code: lastCode,
+        password: raccoonPassword,
+        phone: "1",
+        country: "Brazil",
+        ...base,
+      }),
+    });
+    const regBody = await regRes.json().catch(() => null);
+    if (
+      regRes.status === 200 &&
+      (!regBody || typeof regBody.status !== "number" || regBody.status === 200)
+    ) {
+      break;
+    }
+    const message = regBody?.msg || `HTTP ${regRes.status}`;
+    if (!isHumanVerificationRefusal(message) || regTry >= REGISTER_TRIES) {
+      throw new Error(`registration rejected — HTTP ${regRes.status} · ${message}`);
+    }
+    logSys(
+      chalk.yellow(
+        `register: ${message} — requesting a new code (${regTry}/${REGISTER_TRIES})`,
+      ),
     );
   }
 
@@ -651,7 +791,10 @@ async function createAccountRaw(opts = {}) {
     body: new URLSearchParams({ email, password: raccoonPassword, ...base }),
   });
   const loginData = await loginRes.json();
-  if (loginData.status !== 200) throw new Error("Login failed");
+  if (loginData.status !== 200)
+    throw new Error(
+      `Login failed — ${loginData.msg || `HTTP ${loginRes.status}`} (code ${lastCode})`,
+    );
 
   let userToken = loginData.data?.user_token || "";
   const cookie = loginRes.headers.get("set-cookie");
@@ -1024,12 +1167,16 @@ setInterval(() => {
     }
     const deadline = REAPER_DEADLINES[session.state];
     if (deadline !== undefined) {
-      // A human dragging this session's registration puzzle — and the mailbox
-      // wait that follows — legitimately outlives ordinary account creation, so
-      // a session that raised a puzzle gets the puzzle window on top.
-      const budget = session.puzzle_raised_at
-        ? deadline + PUZZLE_TIMEOUT_MS
-        : deadline;
+      // A human dragging this session's registration puzzles — and the mailbox
+      // wait after each one — legitimately outlives ordinary account creation, so
+      // a session gets the puzzle window on top of its ordinary budget once per
+      // solve it actually asked for. A refused address re-prompts, and that is a
+      // fresh human solve, not a repeat of the first.
+      const puzzleWindows = Math.max(
+        0,
+        (session.puzzle_count ?? (session.puzzle_raised_at ? 1 : 0)) - 1,
+      );
+      const budget = deadline + puzzleWindows * PUZZLE_TIMEOUT_MS;
       if (now - session.created_at > budget) {
         killSession(uuid, `reaper:${session.state}_deadline`);
         continue;
@@ -1249,6 +1396,8 @@ app.get("/cloud/v1/puzzles", auth, (req, res) => {
       id: p.id,
       session: p.session,
       email: p.email,
+      attempt: p.attempt,
+      attempts: p.attempts,
       age_seconds: Math.floor((now - p.created_at) / 1000),
       expires_in_seconds: Math.max(
         0,
@@ -1337,6 +1486,7 @@ app.post("/cloud/v1/createSession", auth, async (req, res) => {
     last_queue_poll_at: null,
     last_ping_at: null,
     puzzle_raised_at: null,
+    puzzle_count: 0,
     startgame_timeout: null,
     queue_abandon_timeout: null,
     ping_timeout: null,
@@ -1360,10 +1510,15 @@ app.post("/cloud/v1/createSession", auth, async (req, res) => {
         // A human is on the clock now, so the reaper grants this session the
         // puzzle window on top of its ordinary creation budget.
         session.puzzle_raised_at = Date.now();
+        // Each re-prompt means the previous address was declared unusable, so
+        // the reaper has to grant another whole puzzle window (see below).
+        session.puzzle_count = (session.puzzle_count || 0) + 1;
         push({
           status: "puzzle_required",
           uuid,
           solve_within_seconds: Math.floor(PUZZLE_TIMEOUT_MS / 1000),
+          attempt: entry.attempt,
+          attempts: entry.attempts,
           puzzle: {
             id: entry.id,
             email: entry.email,

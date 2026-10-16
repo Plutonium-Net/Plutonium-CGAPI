@@ -492,7 +492,13 @@
               base() + "/puzzle?session=" + encodeURIComponent(evt.uuid || uuid || "");
             $("puzzleFrame").src = puzzleUrl;
             $("puzzleLink").href = puzzleUrl;
-            logLine("  ↑ <b>solve the puzzle</b> in the panel below — it gates this account");
+            logLine(
+              "  ↑ <b>solve the puzzle</b> in the panel below — it gates this account" +
+                (evt.attempts > 1
+                  ? " <i>(address " + evt.attempt + " of " + evt.attempts +
+                    " — the previous one was refused or never received the code)" + "</i>"
+                  : ""),
+            );
           }
           if (["account_ready", "queue", "finished_queue"].includes(evt.status))
             $("puzzleWrap").classList.remove("on");
